@@ -128,7 +128,7 @@ def create_argparser():
         sample_interval=11405,
         save_interval=11405,
         save_interval_for_preemption=57025,
-        resume_checkpoint="/home/work/workdir/model_285125.pt",
+        resume_checkpoint="/home/work/dataset/model_353555.pt",
         exp="",
         use_fp16=False,
         fp16_scale_growth=1e-3,

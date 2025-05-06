@@ -213,6 +213,15 @@ class TrainLoop:
         while True:
             for (opt, sar), target in self.data:
                 if self.step >= self.total_training_steps:
+                    (test_opt, test_sar), test_target = next(iter(self.test_data))
+                    test_target = self.preprocess(test_target).to(device=self.device, dtype=self.dtype)
+                    test_opt    = self.preprocess(test_opt).to(device=self.device, dtype=self.dtype)
+                    test_sar    = self.preprocess(test_sar).to(device=self.device, dtype=self.dtype)
+                    
+                    test_batch = test_target
+                    test_cond = {'opt':test_opt, 'sar':test_sar}
+
+                    self.sample_and_save(test_cond)
                     if (self.step - 1) % self.save_interval != 0:
                         self.save()
                     return
@@ -392,45 +401,42 @@ class TrainLoop:
     
     @th.no_grad()
     def sample_and_save(self, cond):
-
         B, C, H, W = cond['opt'].shape
-        sigma_max = self.sample_kwargs.get("s_tmax", 80.0)
+        sigma_max  = self.sample_kwargs.get("s_tmax", 80.0)
 
-        x_T = th.randn(B, C, H, W, device=self.device) * sigma_max
+        opt_noise = th.randn(B, C, H, W, device=self.device) * sigma_max
+        sar_noise = th.randn(B, C, H, W, device=self.device) * sigma_max
+        x_T = (opt_noise, sar_noise)
+
+        x0 = (cond['opt'], cond['sar'])
 
         x_out, path, nfe = karras_sample(
-            diffusion         = self.diffusion,
-            model             = self.ddp_model,
-            x_T               = x_T,
-            x_0               = None,
-            steps             = self.sample_kwargs["steps"],
-            clip_denoised     = self.sample_kwargs.get("clip_denoised", True),
-            progress          = False,
-            callback          = None,
-            model_kwargs      = cond,
-            device            = self.device,
-            sigma_min         = self.sample_kwargs.get("s_tmin", 0.002),
-            sigma_max         = sigma_max,
-            rho               = self.sample_kwargs.get("rho", 7.0),
-            sampler           = self.sample_kwargs.get("sampler", "heun"),
-            churn_step_ratio  = self.sample_kwargs.get("s_churn", 0.0),
-            guidance          = self.sample_kwargs.get("guidance", 1),
+            diffusion        = self.diffusion,
+            model            = self.ddp_model,
+            x_T              = x_T,     
+            x_0              = x0,      # ← tuple of GT images
+            steps            = self.sample_kwargs["steps"],
+            clip_denoised    = self.sample_kwargs.get("clip_denoised", True),
+            progress         = False,
+            callback         = None,
+            model_kwargs     = {},      # denoise doesn’t actually use these for the model call
+            device           = self.device,
+            sigma_min        = self.sample_kwargs.get("s_tmin", 0.002),
+            sigma_max        = sigma_max,
+            rho              = self.sample_kwargs.get("rho", 7.0),
+            sampler          = self.sample_kwargs.get("sampler", "heun"),
+            churn_step_ratio = self.sample_kwargs.get("s_churn", 0.0),
+            guidance         = self.sample_kwargs.get("guidance", 1),
         )
-        out_dir  = os.path.join(get_blob_logdir(), "samples")
+
+        out_dir = os.path.join(get_blob_logdir(), "samples")
         os.makedirs(out_dir, exist_ok=True)
+        from torchvision.utils import save_image
 
-        import wandb
-
-        for i, img in enumerate((x_out+1) * 0.5):
+        for i, img in enumerate((x_out + 1) * 0.5):
             fn = os.path.join(out_dir, f"step{self.step:06d}_final{i}.png")
             save_image(img, fn)
 
-        if dist.get_rank() == 0:
-            wb_imgs = []
-            for i, img in enumerate((x_out+1) * 0.5):
-                np_img = img.cpu().permute(1,2,0).numpy()
-                wb_imgs.append(wandb.Image(np_img, caption=f"step {self.step} sample {i}"))
-            wandb.log({f"samples/step_{self.step:06d}": wb_imgs}, step=self.step)
 
 
 def parse_resume_step_from_filename(filename):
