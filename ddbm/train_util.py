@@ -9,6 +9,7 @@ import torch as th
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import RAdam
+from torchvision.utils import save_image
 
 from . import dist_util, logger
 from .fp16_util import MixedPrecisionTrainer
@@ -47,7 +48,7 @@ class TrainLoop:
         lr,
         ema_rate,
         log_interval,
-        test_interval,
+        sample_interval,
         save_interval,
         save_interval_for_preemption,
         resume_checkpoint,
@@ -75,7 +76,7 @@ class TrainLoop:
         )
         self.log_interval = log_interval
         self.workdir = workdir
-        self.test_interval = test_interval
+        self.sample_interval = sample_interval
         self.save_interval = save_interval
         self.save_interval_for_preemption = save_interval_for_preemption
         self.resume_checkpoint = resume_checkpoint
@@ -91,7 +92,6 @@ class TrainLoop:
         self.global_batch = self.batch_size * dist.get_world_size()
 
         self.sync_cuda = th.cuda.is_available()
-
 
         self._load_and_sync_parameters()
         self.mp_trainer = MixedPrecisionTrainer(
@@ -183,12 +183,17 @@ class TrainLoop:
 
     def _load_optimizer_state(self):
         main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
-        if main_checkpoint.split('/')[-1].startswith("latest"):
-            prefix = 'latest_'
+        base = os.path.basename(main_checkpoint)
+        if base.startswith('latest_'):
+            prefix = "latest_"
+        elif base.startswith('freq_'):
+            prefix = 'freq_'
         else:
             prefix = ''
+
         opt_checkpoint = bf.join(
-            bf.dirname(main_checkpoint), f"{prefix}opt_{self.resume_step:06}.pt"
+            bf.dirname(main_checkpoint), 
+            f"{prefix}opt_{self.resume_step:06}.pt"
         )
         if bf.exists(opt_checkpoint):
             logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
@@ -207,7 +212,7 @@ class TrainLoop:
     def run_loop(self):
         while True:
             for (opt, sar), target in self.data:
-                if not (not self.lr_anneal_steps or self.step < self.total_training_steps):
+                if self.step >= self.total_training_steps:
                     if (self.step - 1) % self.save_interval != 0:
                         self.save()
                     return
@@ -227,15 +232,12 @@ class TrainLoop:
                 if self.step % self.log_interval == 0:
                     logger.dumpkvs()     
 
-                if self.step % self.test_interval == 0:
+                if self.step % self.sample_interval == 0:
                     (test_opt, test_sar), test_target = next(iter(self.test_data))
-                    test_target = self.preprocess(test_target)
-                    test_opt    = self.preprocess(test_opt)
-                    test_sar    = self.preprocess(test_sar)
 
-                    test_target = test_target.to(device=self.device, dtype=self.dtype)
-                    test_opt    = test_opt.to(device=self.device, dtype=self.dtype)
-                    test_sar    = test_sar.to(device=self.device, dtype=self.dtype)
+                    test_target = self.preprocess(test_target).to(device=self.device, dtype=self.dtype)
+                    test_opt    = self.preprocess(test_opt).to(device=self.device, dtype=self.dtype)
+                    test_sar    = self.preprocess(test_sar).to(device=self.device, dtype=self.dtype)
 
                     test_batch = test_target
                     test_cond = {'opt':test_opt, 'sar':test_sar}
@@ -243,6 +245,7 @@ class TrainLoop:
 
                     logger.dumpkvs()
 
+                    self.sample_and_save(test_cond)
 
                 if self.step % self.save_interval == 0:
                     self.save()
@@ -386,23 +389,65 @@ class TrainLoop:
         # loads model at step N, but opt/ema state isn't saved for step N.
         save_checkpoint(0, self.mp_trainer.master_params)
         dist.barrier()
+    
+    @th.no_grad()
+    def sample_and_save(self, cond):
 
+        B, C, H, W = cond['opt'].shape
+        sigma_max = self.sample_kwargs.get("s_tmax", 80.0)
+
+        x_T = th.randn(B, C, H, W, device=self.device) * sigma_max
+
+        x_out, path, nfe = karras_sample(
+            diffusion         = self.diffusion,
+            model             = self.ddp_model,
+            x_T               = x_T,
+            x_0               = None,
+            steps             = self.sample_kwargs["steps"],
+            clip_denoised     = self.sample_kwargs.get("clip_denoised", True),
+            progress          = False,
+            callback          = None,
+            model_kwargs      = cond,
+            device            = self.device,
+            sigma_min         = self.sample_kwargs.get("s_tmin", 0.002),
+            sigma_max         = sigma_max,
+            rho               = self.sample_kwargs.get("rho", 7.0),
+            sampler           = self.sample_kwargs.get("sampler", "heun"),
+            churn_step_ratio  = self.sample_kwargs.get("s_churn", 0.0),
+            guidance          = self.sample_kwargs.get("guidance", 1),
+        )
+        out_dir  = os.path.join(get_blob_logdir(), "samples")
+        os.makedirs(out_dir, exist_ok=True)
+
+        import wandb
+
+        for i, img in enumerate((x_out+1) * 0.5):
+            fn = os.path.join(out_dir, f"step{self.step:06d}_final{i}.png")
+            save_image(img, fn)
+
+        if dist.get_rank() == 0:
+            wb_imgs = []
+            for i, img in enumerate((x_out+1) * 0.5):
+                np_img = img.cpu().permute(1,2,0).numpy()
+                wb_imgs.append(wandb.Image(np_img, caption=f"step {self.step} sample {i}"))
+            wandb.log({f"samples/step_{self.step:06d}": wb_imgs}, step=self.step)
 
 
 def parse_resume_step_from_filename(filename):
     """
     Parse filenames of the form path/to/model_NNNNNN.pt, where NNNNNN is the
     checkpoint's number of steps.
+
     """
-    split = filename.split("model_")
-    if len(split) < 2:
+    base = os.path.basename(filename)      
+    name = base.rsplit(".", 1)[0]
+    if "_" not in name:
         return 0
-    split1 = split[-1].split(".")[0]
+    step_str = name.rsplit("_", 1)[1]
     try:
-        return int(split1)
+        return int(step_str)
     except ValueError:
         return 0
-
 
 def get_blob_logdir():
     # You can change this to be a separate path to save checkpoints to
@@ -421,6 +466,8 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
         return None
     if main_checkpoint.split('/')[-1].startswith("latest"):
         prefix = 'latest_'
+    elif main_checkpoint.split('/')[-1].startswith("freq"):
+        prefix = 'freq_'
     else:
         prefix = ''
     filename = f"{prefix}ema_{rate}_{(step):06d}.pt"

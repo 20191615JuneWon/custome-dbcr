@@ -14,7 +14,6 @@ from .nn import mean_flat, append_dims, append_zero
 from functools import partial
 
 
-# TODO: WHOLE!!
 def vp_logsnr(t, beta_d, beta_min):
     t = th.as_tensor(t)
     return - th.log((0.5 * beta_d * (t ** 2) + beta_min * t).exp() - 1)
@@ -176,6 +175,7 @@ class KarrasDenoiser(nn.Module):
         return model_output, denoised
     
 
+# diffusion, model, x_t, x_0
 def karras_sample(
     diffusion,
     model,

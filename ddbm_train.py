@@ -6,6 +6,8 @@ import torch as th
 import torch.distributed as dist
 from torchinfo import summary
 
+import wandb
+
 from ddbm import dist_util, logger
 from datasets import load_data
 
@@ -29,9 +31,11 @@ def main(args):
     device = dist_util.dev()
 
     logger.configure(dir=workdir)
+
     if dist.get_rank() == 0:
         name = args.exp if args.resume_checkpoint == "" else args.exp + "_resume"
-        logger.log(name)
+        wandb.init(project="dbcr", group=args.exp, name=name, config=vars(args), mode='online' if not args.debug else 'disabled')
+        logger.log("creating model and diffusion...")
 
     md_kwargs = args_to_dict(args, model_and_diffusion_defaults().keys())
     model, diffusion = create_model_and_diffusion(**md_kwargs)
@@ -43,6 +47,8 @@ def main(args):
     if hasattr(diffusion, "to"):
         diffusion.to(device)
 
+    if dist.get_rank() == 0:
+        wandb.watch(model, log='all')
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
     if args.batch_size == -1:
@@ -51,7 +57,6 @@ def main(args):
             logger.log(
                 f"Warning: global_batch_size {args.global_batch_size} not divisible by world_size {dist.get_world_size()}, using {per_gpu*dist.get_world_size()} instead."
             )
-        batch_size = per_gpu
     else:
         batch_size = args.batch_size
 
@@ -72,6 +77,8 @@ def main(args):
         augment = AugmentPipe(
             p=0.12, xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1
         )
+    else:
+        augment = None
 
     # 6) 학습 루프 실행
     logger.log("Training...")
@@ -85,7 +92,7 @@ def main(args):
         lr=args.lr,
         ema_rate=args.ema_rate,
         log_interval=args.log_interval,
-        test_interval=args.test_interval,
+        sample_interval=args.sample_interval,
         save_interval=args.save_interval,
         save_interval_for_preemption=args.save_interval_for_preemption,
         resume_checkpoint=args.resume_checkpoint,
@@ -117,11 +124,11 @@ def create_argparser():
         batch_size=4,                 # 40 -> 4 -> 8 x -> B * 23(image) * 256 * 256 -> 128 * 128
         microbatch=1,
         ema_rate="0.9999",
-        log_interval=50,
-        test_interval=1000,
-        save_interval=10000,
-        save_interval_for_preemption=50000,
-        resume_checkpoint="",
+        log_interval=125,
+        sample_interval=11405,
+        save_interval=11405,
+        save_interval_for_preemption=57025,
+        resume_checkpoint="/home/work/workdir/model_285125.pt",
         exp="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
