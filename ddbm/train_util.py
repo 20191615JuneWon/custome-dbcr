@@ -397,51 +397,47 @@ class TrainLoop:
 
     @th.no_grad()
     def sample_and_save(self, cond, target):
-
-        opt = cond['opt']
-        sar = cond['sar']
-
+        opt, sar = cond['opt'], cond['sar']
         x_t = (opt, sar)
 
-        sample, path, nfe = karras_sample(
-            diffusion=self.diffusion,
-            model=self.model, 
-            x_T=x_t,
-            x_0=None,
-            steps=self.step,
-            clip_denoised=None,
-            progress=False,
-            callback=None,
-            model_kwargs=self.sample_kwargs,
-            device=self.device
+        # 1) Run the sampler with all the correct args
+        sample, _, _ = karras_sample(
+            diffusion      = self.diffusion,
+            model          = self.model,
+            x_T            = x_t,
+            x_0            = None,                      # unused by karras_sample
+            steps          = 40,                        # or self.step?
+            progress       = False,
+            callback       = None,
+            model_kwargs   = self.sample_kwargs,
+            device         = self.device,
         )
-        
-        sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
-        
+
+        # 2) Single scale: [-1,1] → [0,1]
         imgs = (sample + 1) * 0.5
-        imgs = imgs.clamp(0, 1).detach().cpu()
-                
+        imgs = imgs.clamp(0, 1).cpu()
+
         out_dir = os.path.join(get_blob_logdir(), "samples")
         os.makedirs(out_dir, exist_ok=True)
 
+        # 3) Save each image
         for i, img in enumerate(imgs):
-            img = img[[3, 2, 1], :, :]
-            fn = os.path.join(out_dir, f"step{self.step:06d}_opt{i}.png")
+            # if your MS bands are 13-channel, pick the 3 you want to view:
+            img = img[[3, 2, 1], :, :]   # e.g. bands 4,3,2 → RGB
+            fn  = os.path.join(out_dir, f"step_opt{i}.png")
             save_image(img, fn)
 
+        # 4) Optionally save the GT in the same way
         if target is not None:
-            # print(min(target), max(target))
-            # print(target[:, [3,2,1], :, :])
-
-            # targ = (target + 1) * 0.5
-            target = (target + 1) * 0.5
-            target = target.clamp(0, 1).detach().cpu()
-            for i, img in enumerate(target):
+            gt = (target + 1) * 0.5
+            gt = gt.clamp(0, 1).cpu()
+            for i, img in enumerate(gt):
                 img = img[[3, 2, 1], :, :]
-                fn = os.path.join(out_dir, f"GT_step{self.step:06d}_{i}.png")
+                fn  = os.path.join(out_dir, f"GT_step_{i}.png")
                 save_image(img, fn)
 
-        print(f"[inference] saved {imgs.shape[0]} imges at step {self.step}")
+        print(f"[inference] saved {imgs.shape[0]} images")
+
 
 
 def parse_resume_step_from_filename(filename):

@@ -160,6 +160,7 @@ class KarrasDenoiser(nn.Module):
         return {'loss': l1}
 
     def denoise(self, model, x_t, sigmas, **model_kwargs):
+        print("start denoise")
         opt_t, sar_t = x_t
 
         c_skip, c_out, c_in = [
@@ -168,14 +169,14 @@ class KarrasDenoiser(nn.Module):
         ]
 
         rescaled_t = (1000 * 0.25 * th.log(sigmas + 1e-44)).to(self.dtype)
-        for k, v in model_kwargs.items():
-            model_kwargs[k] = v.to(self.dtype)
+        # for k, v in model_kwargs.items():
+        #     model_kwargs[k] = v.to(self.dtype)
 
         opt_in = c_in * opt_t
 
         model_output = model(x=opt_in, t=rescaled_t, opt=opt_in, sar=sar_t).to(self.dtype)
         denoised     = c_out * model_output + c_skip * opt_t
-
+        print("denoise return")
         return model_output, denoised
     
 
@@ -323,7 +324,8 @@ def sample_heun(
     x = opt_T
     B = x.shape[0]
     s_in = x.new_ones([B])
-    path = [x.detach().cup()]
+    path = []
+    # path = [x.detach().cup()]
 
     nfe = 0
 
@@ -334,14 +336,14 @@ def sample_heun(
         # other VP helpers omitted for brevity
 
     # Iterate through noise levels
-    for i in range(len(sigmas)-1):
+    for i in range(40):
         sigma_i, sigma_j = sigmas[i], sigmas[i+1]
         # Compute sigma_hat
         sigma_hat = sigma_i + churn_step_ratio*(sigma_j - sigma_i)
 
         # Predictor: first slope
         denoised1 = denoiser((x, sar), sigma_hat * s_in)
-        d1 = to_d(x, sigma_hat, denoised1, opt_T, w=guidance) if pred_mode=='ve' else get_d_vp(x, denoised1, opt_T, sigma_hat, guidance)
+        d1 = to_d(x, sigma_hat, denoised1, opt_T, sigma_max=sigma_max, w=guidance) if pred_mode=='ve' else get_d_vp(x, denoised1, opt_T, sigma_hat, guidance)
         nfe += 1
 
         dt = sigma_j - sigma_hat
@@ -351,14 +353,14 @@ def sample_heun(
             # Heun corrector
             x_mid = x + d1 * dt
             denoised2 = denoiser((x_mid, sar), sigma_j * s_in)
-            d2 = to_d(x_mid, sigma_j, denoised2, opt_T, w=guidance) if pred_mode=='ve' else get_d_vp(x_mid, denoised2, opt_T, sigma_j, guidance)
+            d2 = to_d(x_mid, sigma_j, denoised2, opt_T, sigma_max=sigma_max, w=guidance) if pred_mode=='ve' else get_d_vp(x_mid, denoised2, opt_T, sigma_j, guidance)
             x = x + 0.5*(d1 + d2) * dt
             nfe += 1
 
         # Callback and record
         if callback:
             callback({'x': x, 'i': i, 'sigma': sigma_i, 'sigma_hat': sigma_hat, 'denoised': denoised1})
-        path.append(x.detach().cpu())
+        # path.append(x.detach().cpu())
 
     return x, path, nfe
 
