@@ -218,21 +218,16 @@ class TrainLoop:
                     test_opt    = self.preprocess(test_opt).to(device=self.device, dtype=self.dtype)
                     test_sar    = self.preprocess(test_sar).to(device=self.device, dtype=self.dtype)
                     
-                    test_batch = test_target
                     test_cond = {'opt':test_opt, 'sar':test_sar}
 
-                    self.sample_and_save(test_cond)
+                    self.sample_and_save(test_cond, test_target)
                     if (self.step - 1) % self.save_interval != 0:
                         self.save()
                     return
 
-                target = self.preprocess(target)
-                opt    = self.preprocess(opt)
-                sar    = self.preprocess(sar)
-
-                target = target.to(device=self.device, dtype=self.dtype)
-                opt    = opt.to(device=self.device, dtype=self.dtype)
-                sar    = sar.to(device=self.device, dtype=self.dtype)
+                target = self.preprocess(target).to(device=self.device, dtype=self.dtype)
+                opt    = self.preprocess(opt).to(device=self.device, dtype=self.dtype)
+                sar    = self.preprocess(sar).to(device=self.device, dtype=self.dtype)
 
                 batch = target
                 cond = {'opt': opt, 'sar': sar}
@@ -254,7 +249,7 @@ class TrainLoop:
 
                     logger.dumpkvs()
 
-                    self.sample_and_save(test_cond)
+                    self.sample_and_save(test_cond, test_target)
 
                 if self.step % self.save_interval == 0:
                     self.save()
@@ -399,44 +394,54 @@ class TrainLoop:
         save_checkpoint(0, self.mp_trainer.master_params)
         dist.barrier()
     
+
     @th.no_grad()
-    def sample_and_save(self, cond):
-        B, C, H, W = cond['opt'].shape
-        sigma_max  = self.sample_kwargs.get("s_tmax", 80.0)
+    def sample_and_save(self, cond, target):
 
-        opt_noise = th.randn(B, C, H, W, device=self.device) * sigma_max
-        sar_noise = th.randn(B, C, H, W, device=self.device) * sigma_max
-        x_T = (opt_noise, sar_noise)
+        opt = cond['opt']
+        sar = cond['sar']
 
-        x0 = (cond['opt'], cond['sar'])
+        x_t = (opt, sar)
 
-        x_out, path, nfe = karras_sample(
-            diffusion        = self.diffusion,
-            model            = self.ddp_model,
-            x_T              = x_T,     
-            x_0              = x0,      # ← tuple of GT images
-            steps            = self.sample_kwargs["steps"],
-            clip_denoised    = self.sample_kwargs.get("clip_denoised", True),
-            progress         = False,
-            callback         = None,
-            model_kwargs     = {},      # denoise doesn’t actually use these for the model call
-            device           = self.device,
-            sigma_min        = self.sample_kwargs.get("s_tmin", 0.002),
-            sigma_max        = sigma_max,
-            rho              = self.sample_kwargs.get("rho", 7.0),
-            sampler          = self.sample_kwargs.get("sampler", "heun"),
-            churn_step_ratio = self.sample_kwargs.get("s_churn", 0.0),
-            guidance         = self.sample_kwargs.get("guidance", 1),
+        sample, path, nfe = karras_sample(
+            diffusion=self.diffusion,
+            model=self.model, 
+            x_T=x_t,
+            x_0=None,
+            steps=self.step,
+            clip_denoised=None,
+            progress=False,
+            callback=None,
+            model_kwargs=self.sample_kwargs,
+            device=self.device
         )
-
+        
+        sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+        
+        imgs = (sample + 1) * 0.5
+        imgs = imgs.clamp(0, 1).detach().cpu()
+                
         out_dir = os.path.join(get_blob_logdir(), "samples")
         os.makedirs(out_dir, exist_ok=True)
-        from torchvision.utils import save_image
 
-        for i, img in enumerate((x_out + 1) * 0.5):
-            fn = os.path.join(out_dir, f"step{self.step:06d}_final{i}.png")
+        for i, img in enumerate(imgs):
+            img = img[[3, 2, 1], :, :]
+            fn = os.path.join(out_dir, f"step{self.step:06d}_opt{i}.png")
             save_image(img, fn)
 
+        if target is not None:
+            # print(min(target), max(target))
+            # print(target[:, [3,2,1], :, :])
+
+            # targ = (target + 1) * 0.5
+            target = (target + 1) * 0.5
+            target = target.clamp(0, 1).detach().cpu()
+            for i, img in enumerate(target):
+                img = img[[3, 2, 1], :, :]
+                fn = os.path.join(out_dir, f"GT_step{self.step:06d}_{i}.png")
+                save_image(img, fn)
+
+        print(f"[inference] saved {imgs.shape[0]} imges at step {self.step}")
 
 
 def parse_resume_step_from_filename(filename):

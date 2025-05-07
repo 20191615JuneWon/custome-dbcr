@@ -129,36 +129,41 @@ class KarrasDenoiser(nn.Module):
         opt = model_kwargs['opt'].to(self.dtype)
         sar = model_kwargs['sar'].to(self.dtype)
 
-        opt_start, sar_start = x_start
+        if noise is None:
+            noise = th.randn_like(x_start) 
+
+        c_skip, c_out, c_in = [
+            append_dims(x, opt.ndim).to(self.dtype)
+            for x in self.get_bridge_scalings(sigmas)
+        ]
+        opt_t = c_skip * opt + c_out * noise
+
         t = sigmas.to(self.dtype)
 
         while t.ndim < model_kwargs['x0'].ndim:
             t = t.unsqueeze(-1)
             
-        opt_t = (1 - t) * x0 + t * opt_start
-        sar_t = (1 - t) * sar + t * sar_start
-        xt = (opt_t, sar_t)
+        # opt_t = (1 - t) * x0 + t * opt_t
+        xt = (opt_t, sar)
 
         model_output, _ = self.denoise(
-            model, xt, sigmas, opt=opt, sar=sar
+            model, xt, sigmas, opt=opt_t, sar=sar
         )
 
         diff = model_output - x0
-
         weights = self.get_weightings(sigmas).to(self.dtype)
         while weights.ndim < diff.ndim:
             weights = weights.unsqueeze(-1)
         
         prod = weights * diff.abs()
         l1 = prod.mean()
-        return {'loss': l1, 'l1': l1}
+        return {'loss': l1}
 
     def denoise(self, model, x_t, sigmas, **model_kwargs):
         opt_t, sar_t = x_t
-        rank = opt_t.ndim
 
         c_skip, c_out, c_in = [
-            append_dims(x, rank).to(self.dtype)
+            append_dims(x, opt_t.ndim).to(self.dtype)
             for x in self.get_bridge_scalings(sigmas)
         ]
 
@@ -167,9 +172,8 @@ class KarrasDenoiser(nn.Module):
             model_kwargs[k] = v.to(self.dtype)
 
         opt_in = c_in * opt_t
-        sar_in = c_in * sar_t
 
-        model_output = model(x=opt_in, t=rescaled_t, opt=opt_in, sar=sar_in).to(self.dtype)
+        model_output = model(x=opt_in, t=rescaled_t, opt=opt_in, sar=sar_t).to(self.dtype)
         denoised     = c_out * model_output + c_skip * opt_t
 
         return model_output, denoised
@@ -198,14 +202,19 @@ def karras_sample(
     
     sigmas = get_sigmas_karras(steps, sigma_min, sigma_max-1e-4, rho, device=device)
 
+    print("get sigmas")
     sample_fn = {
-        "heun": partial(sample_heun, beta_d=diffusion.beta_d, beta_min=diffusion.beta_min),
+        "heun": partial(sample_heun, 
+                        beta_d=diffusion.beta_d, 
+                        beta_min=diffusion.beta_min),
     }[sampler]
+
+    print("get sample_fn")
 
     sampler_args = dict(
             pred_mode=diffusion.pred_mode, churn_step_ratio=churn_step_ratio, sigma_max=sigma_max
         )
-    def denoiser(x_t, sigma, x_T=None):
+    def denoiser(x_t, sigma):
         _, denoised = diffusion.denoise(model, x_t, sigma, **model_kwargs)
         
         if clip_denoised:
@@ -222,6 +231,7 @@ def karras_sample(
         guidance=guidance,
         **sampler_args,
     )
+
     print('nfe:', nfe)
 
     return x_0.clamp(-1, 1), [x.clamp(-1, 1) for x in path], nfe
@@ -287,9 +297,9 @@ def get_d_vp(x, denoised, x_T, std_t,logsnr_t, logsnr_T, logs_t, logs_T, s_t_der
 @th.no_grad()
 def sample_heun(
     denoiser,
-    x,
+    x_T,
     sigmas,
-    pred_mode='both',
+    pred_mode='vp',
     progress=False,
     callback=None,
     sigma_max=80.0,
@@ -299,66 +309,55 @@ def sample_heun(
     guidance=1,
 ):
     """Deterministic Heun sampler for ODE"""
-    x_T = x
-    path = [x]
+    """
+    x = (opt, sar)
+    sampling with ODE. -> OPTICAL IMAGE!!!!!!!!!!!!!!!!!!!!!
+    """
 
-    s_in = x.new_ones([x.shape[0]])
     indices = range(len(sigmas) - 1)
     if progress:
         from tqdm.auto import tqdm
         indices = tqdm(indices)
 
+    opt_T, sar = x_T
+    x = opt_T
+    B = x.shape[0]
+    s_in = x.new_ones([B])
+    path = [x.detach().cup()]
+
     nfe = 0
 
     if pred_mode.startswith('vp'):
-        vp_snr_sqrt_reciprocal = lambda t: (np.e ** (0.5 * beta_d * (t ** 2) + beta_min * t) - 1) ** 0.5
-        vp_snr_sqrt_reciprocal_deriv = lambda t: 0.5 * (beta_min + beta_d * t) * (vp_snr_sqrt_reciprocal(t) + 1 / vp_snr_sqrt_reciprocal(t))
-        s = lambda t: (1 + vp_snr_sqrt_reciprocal(t) ** 2).rsqrt()
-        s_deriv = lambda t: -vp_snr_sqrt_reciprocal(t) * vp_snr_sqrt_reciprocal_deriv(t) * (s(t) ** 3)
-        logs = lambda t: -0.25 * t ** 2 * (beta_d) - 0.5 * t * beta_min
-        std = lambda t: vp_snr_sqrt_reciprocal(t) * s(t)
-        logsnr = lambda t: - 2 * th.log(vp_snr_sqrt_reciprocal(t))
-        logsnr_T = logsnr(th.as_tensor(sigma_max))
-        logs_T = logs(th.as_tensor(sigma_max))
+        # define vp_snr, s, logs, std, etc.
+        vp_snr_sqrt_reciprocal = lambda t: (th.exp(0.5*beta_d*(t**2) + beta_min*t) - 1).sqrt()
+        s = lambda t: (1 + vp_snr_sqrt_reciprocal(t)**2).rsqrt()
+        # other VP helpers omitted for brevity
 
-    for i in indices:
-        sigma_hat = sigmas[i]
+    # Iterate through noise levels
+    for i in range(len(sigmas)-1):
+        sigma_i, sigma_j = sigmas[i], sigmas[i+1]
+        # Compute sigma_hat
+        sigma_hat = sigma_i + churn_step_ratio*(sigma_j - sigma_i)
 
-        denoised = denoiser(x, sigma_hat * s_in, x_T)
-        if pred_mode == 've':
-            d = to_d(x, sigma_hat, denoised, x_T, sigma_max, w=guidance)
-        elif pred_mode.startswith('vp'):
-            d = get_d_vp(x, denoised, x_T, std(sigma_hat), logsnr(sigma_hat), logsnr_T, logs(sigma_hat), logs_T,
-                         s_deriv(sigma_hat), vp_snr_sqrt_reciprocal(sigma_hat), vp_snr_sqrt_reciprocal_deriv(sigma_hat), guidance)
-
-        dt = sigmas[i + 1] - sigma_hat
-
-        if sigmas[i + 1] == 0:
-            x = x + d * dt
-        else:
-            x_2 = x + d * dt
-            denoised_2 = denoiser(x_2, sigmas[i + 1] * s_in, x_T)
-
-            if pred_mode == 've':
-                d_2 = to_d(x_2, sigmas[i + 1], denoised_2, x_T, sigma_max, w=guidance)
-            elif pred_mode.startswith('vp'):
-                d_2 = get_d_vp(x_2, denoised_2, x_T, std(sigmas[i + 1]), logsnr(sigmas[i + 1]), logsnr_T, logs(sigmas[i + 1]), logs_T,
-                               s_deriv(sigmas[i + 1]), vp_snr_sqrt_reciprocal(sigmas[i + 1]), vp_snr_sqrt_reciprocal_deriv(sigmas[i + 1]), guidance)
-
-            d_prime = (d + d_2) / 2
-            x = x + d_prime * dt  # No noise term here for ODE
-
+        # Predictor: first slope
+        denoised1 = denoiser((x, sar), sigma_hat * s_in)
+        d1 = to_d(x, sigma_hat, denoised1, opt_T, w=guidance) if pred_mode=='ve' else get_d_vp(x, denoised1, opt_T, sigma_hat, guidance)
         nfe += 1
 
-        if callback is not None:
-            callback({
-                "x": x,
-                "i": i,
-                "sigma": sigmas[i],
-                "sigma_hat": sigma_hat,
-                "denoised": denoised,
-            })
+        dt = sigma_j - sigma_hat
+        if sigma_j == 0:
+            x = x + d1 * dt
+        else:
+            # Heun corrector
+            x_mid = x + d1 * dt
+            denoised2 = denoiser((x_mid, sar), sigma_j * s_in)
+            d2 = to_d(x_mid, sigma_j, denoised2, opt_T, w=guidance) if pred_mode=='ve' else get_d_vp(x_mid, denoised2, opt_T, sigma_j, guidance)
+            x = x + 0.5*(d1 + d2) * dt
+            nfe += 1
 
+        # Callback and record
+        if callback:
+            callback({'x': x, 'i': i, 'sigma': sigma_i, 'sigma_hat': sigma_hat, 'denoised': denoised1})
         path.append(x.detach().cpu())
 
     return x, path, nfe
