@@ -130,7 +130,7 @@ class KarrasDenoiser(nn.Module):
         sar = model_kwargs['sar'].to(self.dtype)
 
         if noise is None:
-            noise = th.randn_like(x_start) 
+            noise = th.randn_like(x0) 
 
         c_skip, c_out, c_in = [
             append_dims(x, opt.ndim).to(self.dtype)
@@ -160,7 +160,7 @@ class KarrasDenoiser(nn.Module):
         return {'loss': l1}
 
     def denoise(self, model, x_t, sigmas, **model_kwargs):
-        print("start denoise")
+        # print("start denoise")
         opt_t, sar_t = x_t
 
         c_skip, c_out, c_in = [
@@ -176,7 +176,7 @@ class KarrasDenoiser(nn.Module):
 
         model_output = model(x=opt_in, t=rescaled_t, opt=opt_in, sar=sar_t).to(self.dtype)
         denoised     = c_out * model_output + c_skip * opt_t
-        print("denoise return")
+        # print("denoise return")
         return model_output, denoised
     
 
@@ -203,14 +203,14 @@ def karras_sample(
     
     sigmas = get_sigmas_karras(steps, sigma_min, sigma_max-1e-4, rho, device=device)
 
-    print("get sigmas")
+    # print("get sigmas")
     sample_fn = {
         "heun": partial(sample_heun, 
                         beta_d=diffusion.beta_d, 
                         beta_min=diffusion.beta_min),
     }[sampler]
 
-    print("get sample_fn")
+    # print("get sample_fn")
 
     sampler_args = dict(
             pred_mode=diffusion.pred_mode, churn_step_ratio=churn_step_ratio, sigma_max=sigma_max

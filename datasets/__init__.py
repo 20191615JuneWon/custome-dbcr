@@ -303,7 +303,7 @@ def load_data(
         batch_size=batch_size,
         shuffle=True,
         generator=shuffle_gen,
-        num_workers=0,
+        num_workers=16,
         pin_memory=True,
         collate_fn=collate_fn,
     )
@@ -312,7 +312,7 @@ def load_data(
         dataset=valset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=16,
         pin_memory=True,
         collate_fn=collate_fn,
     )
