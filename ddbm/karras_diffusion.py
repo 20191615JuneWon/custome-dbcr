@@ -14,13 +14,15 @@ from .nn import mean_flat, append_dims, append_zero
 from functools import partial
 
 
-def vp_logsnr(t, beta_d, beta_min):
+def vp_logsnr(t, beta_d, beta_min, eps=1e-8):
     t = th.as_tensor(t)
-    return - th.log((0.5 * beta_d * (t ** 2) + beta_min * t).exp() - 1)
-
+    val = (0.5 * beta_d * (t ** 2) + beta_min * t).exp() - 1
+    val = val.clamp(min=eps)
+    return - th.log(val + eps)
+    
 def vp_logs(t, beta_d, beta_min):
     t = th.as_tensor(t)
-    return -0.25 * t ** 2 * beta_d - 0.5 * t * beta_min
+    return -0.25 * t ** 2 * (beta_d) - 0.5 * t * beta_min
 
 class KarrasDenoiser(nn.Module):
     """
@@ -35,10 +37,10 @@ class KarrasDenoiser(nn.Module):
         beta_min: float = 0.1,
         cov_xy: float = 0.0,
         rho: float = 7.0,
-        pred_mode: str = 'both',        # 've', 'vp', 've_simple', ...
+        pred_mode: str = 'vp',        # 've', 'vp', 've_simple', ...
         weight_schedule: str = 'karras',
         loss_norm: str = 'lpips',
-        num_timesteps: int = 1000,
+        num_timesteps: int = 40,
         image_size: int = 256,
         dtype=th.float32,
     ):
@@ -52,139 +54,190 @@ class KarrasDenoiser(nn.Module):
         self.rho           = rho
         self.pred_mode     = pred_mode
         self.weight_schedule = weight_schedule
-        self.num_timesteps = num_timesteps
+        self.num_timesteps = 40
         self.image_size    = image_size
 
+        self.sigma_data_end = self.sigma_data
+        self.c = 1
+        
         # loss
         self.loss_norm = loss_norm
         if loss_norm == 'lpips':
             self.lpips = LPIPS(replace_pooling=True, reduction='none')
         self.dtype = dtype
 
-    def to(self, dtype):
+    # def to(self, dtype):
+    #     self.dtype = dtype
+    #     if self.loss_norm == 'lpips':
+    #         self.lpips = self.lpips.to(dtype)
+    #     return self
 
-        self.dtype = dtype
-        if self.loss_norm == 'lpips':
-            self.lpips = self.lpips.to(dtype)
-        return self
-
-    def get_snr(self, sigma):
+    def get_snr(self, sigmas):
         if self.pred_mode.startswith('vp'):
-            return vp_logsnr(sigma, self.beta_d, self.beta_min).exp()
-        return sigma.pow(-2)
+            return vp_logsnr(sigmas, self.beta_d, self.beta_min).exp()
+        else:
+            return sigmas**-2
+    
+    def get_sigmas(self, sigmas):
+        return sigmas
 
     def get_weightings(self, sigma):
-        snr = self.get_snr(sigma)
-        if self.weight_schedule == 'karras':
-            return snr + 1.0 / (self.sigma_data ** 2)
-        if self.weight_schedule == 'snr':
-            return snr
-        if self.weight_schedule == 'uniform':
-            return th.ones_like(snr)
-        # add other schedules as needed
-        raise NotImplementedError(self.weight_schedule)
+        snrs = self.get_snr(sigma)
+
+        if self.weight_schedule == "snr":
+            weightings = snrs
+        elif self.weight_schedule == "snr+1":
+            weightings = snrs + 1
+        elif self.weight_schedule == "karras":
+            weightings = snrs + 1.0 / self.sigma_data**2
+        elif self.weight_schedule.startswith("bridge_karras"):
+            if self.pred_mode == 've':
+                A = sigma**4 / self.sigma_max**4 * self.sigma_data_end**2 + (1 - sigma**2 / self.sigma_max**2)**2 * self.sigma_data**2 + 2*sigma**2 / self.sigma_max**2 * (1 - sigma**2 / self.sigma_max**2) * self.cov_xy + self.c**2 * sigma**2 * (1 - sigma**2 / self.sigma_max**2)
+                weightings = A / ((sigma/self.sigma_max)**4 * (self.sigma_data_end**2 * self.sigma_data**2 - self.cov_xy**2) + self.sigma_data**2 * self.c**2 * sigma**2 * (1 - sigma**2/self.sigma_max**2) )
+            
+            
+            elif self.pred_mode == 'vp':
+                logsnr_t = vp_logsnr(sigma, self.beta_d, self.beta_min)
+                logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
+                logs_t = vp_logs(sigma, self.beta_d, self.beta_min)
+                logs_T = vp_logs(self.sigma_max, self.beta_d, self.beta_min)
+
+                delta = (logsnr_T - logsnr_t + logs_t - logs_T)
+                a_t = delta.exp().clamp(min=1e-8, max=1e8)
+                expm1_val = th.expm1(logsnr_T - logsnr_t).clamp(min=1e-8, max=1e8)
+                b_t = -expm1_val * logs_t.exp().clamp(min=1e-8, max=1e8)
+                c_t = -expm1_val * (2*logs_t - logsnr_t).exp().clamp(min=1e-8, max=1e8)
+
+                A = a_t**2 * self.sigma_data_end**2 + b_t**2 * self.sigma_data**2 + 2*a_t * b_t * self.cov_xy + self.c**2 * c_t
+                print("A", A)
+                denominator = a_t**2 * (self.sigma_data_end**2 * self.sigma_data**2 - self.cov_xy**2) + self.sigma_data**2 * self.c**2 * c_t
+                weightings = A / (denominator + 1e-8)
+
+            elif self.pred_mode == 'vp_sample' or self.pred_mode == 've_simple':
+
+                weightings = th.ones_like(snrs)
+        elif self.weight_schedule == "truncated-snr":
+            weightings = th.clamp(snrs, min=1.0)
+        elif self.weight_schedule == "uniform":
+            weightings = th.ones_like(snrs)
+        else:
+            raise NotImplementedError()
+
+        return weightings
+
 
     def get_bridge_scalings(self, sigma):
+        sigma_data = self.sigma_data
+        sigma_data_end = self.sigma_data_end
+        cov_xy = self.cov_xy
+        sigma_max = self.sigma_max
+
         t = sigma
-        if self.pred_mode == 've':
-            A = (
-                (t**4)/(self.sigma_max**4)*self.sigma_data**2
-                + (1 - t**2/self.sigma_max**2)**2 * self.sigma_data**2
-                + 2*(t**2/self.sigma_max**2)*(1 - t**2/self.sigma_max**2)*self.cov_xy
-                + t**2*(1 - t**2/self.sigma_max**2)
-            )
-            c_in  = A.rsqrt()
-            c_skip = ((1 - t**2/self.sigma_max**2)*self.sigma_data**2
-                      + (t**2/self.sigma_max**2)*self.cov_xy) * c_in
-            c_out = ( (
-                (t/self.sigma_max)**4 * (self.sigma_data**4 - self.cov_xy**2)
-                + self.sigma_data**2 * t**2*(1 - t**2/self.sigma_max**2)
-            ).sqrt() * c_in )
-            return c_skip, c_out, c_in
-        if self.pred_mode.startswith('vp'):
-            logsnr_t = vp_logsnr(t, self.beta_d, self.beta_min)
-            logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
-            logs_t   = vp_logs(t, self.beta_d, self.beta_min)
-            logs_T   = vp_logs(self.sigma_max, self.beta_d, self.beta_min)
+        alpha_t = th.ones_like(t)
+        alpha_bar_t = alpha_t
+        rho_t = t
+        rho_T = sigma_max
+        rho_bar_t = (rho_T**2 - rho_t**2).clamp(min=0).sqrt()
+        a_t = (alpha_bar_t * rho_t**2) / rho_T**2
+        b_t = (alpha_t * rho_bar_t**2) / rho_T**2
+        c_t = (alpha_t * rho_bar_t * rho_t) / rho_T
 
-            a_t = (logsnr_T - logsnr_t + logs_t - logs_T).exp()
-            b_t = -th.expm1(logsnr_T - logsnr_t) * logs_t.exp()
-            c_t = -th.expm1(logsnr_T - logsnr_t) * (2*logs_t - logsnr_t).exp()
+        A = a_t**2 * sigma_data_end**2 + b_t**2 * sigma_data**2 + 2 * a_t * b_t * cov_xy + c_t**2
+        c_in = 1 / (A) ** 0.5
+        c_skip = (b_t * sigma_data**2 + a_t * cov_xy) / A
+        c_out = (
+            a_t**2 * (sigma_data_end**2 * sigma_data**2 - cov_xy**2) + sigma_data**2 * c_t**2
+        ).clamp(min=1e-8).sqrt() * c_in
 
-            A = a_t**2*self.sigma_data**2 + b_t**2*self.sigma_data**2 \
-                + 2*a_t*b_t*self.cov_xy + c_t
-            c_in   = A.rsqrt()
-            c_skip = (b_t*self.sigma_data**2 + a_t*self.cov_xy) * c_in
-            c_out  = ( (a_t**2*(self.sigma_data**4 - self.cov_xy**2)
-                        + self.sigma_data**2*c_t).sqrt() * c_in )
-            return c_skip, c_out, c_in
+        c_in = c_in.clamp(min=1e-3, max=10)
+        c_skip = c_skip.clamp(min=-1, max=1)
+        c_out = c_out.clamp(min=1e-3, max=10)
 
-        # simple modes
-        return th.zeros_like(sigma), th.ones_like(sigma), th.ones_like(sigma)
+        return c_skip, c_out, c_in
 
-    def training_bridge_losses(self, model, x_start, sigmas, model_kwargs, noise=None):  
-        sigmas = sigmas.clamp(min=1e-6, max=self.sigma_max)
 
-        x0 = model_kwargs['x0'].to(self.dtype)
+    def training_bridge_losses(
+            self,
+            model,
+            sigmas,
+            model_kwargs,
+            noise=None
+        ):
+        assert model_kwargs is not None
+
+        x0  = model_kwargs['x0'].to(self.dtype)
         opt = model_kwargs['opt'].to(self.dtype)
         sar = model_kwargs['sar'].to(self.dtype)
 
         if noise is None:
-            noise = th.randn_like(x0) 
+            noise = th.randn_like(x0)
 
+        sigmas = th.minimum(sigmas, th.ones_like(sigmas)* self.sigma_max)
+        sigmas = sigmas.clamp(min=self.sigma_min, max=self.sigma_max)
+
+        xT = opt + self.sigma_max * noise
+        terms = {}
+
+        t = sigmas
+        sigma_max = self.sigma_max
+        alpha_t = th.ones_like(t)
+        alpha_bar_t = alpha_t  # alpha_T = 1
+        rho_t = t
+        rho_T = sigma_max
+        rho_bar_t = (rho_T**2 - rho_t**2).clamp(min=0).sqrt()
+
+        a_t = (alpha_bar_t * rho_t**2) / rho_T**2
+        b_t = (alpha_t * rho_bar_t**2) / rho_T**2
+        c_t = (alpha_t * rho_bar_t * rho_t) / rho_T
+
+        a_t = a_t.view(-1, *[1]*(x0.ndim-1))
+        b_t = b_t.view(-1, *[1]*(x0.ndim-1))
+        c_t = c_t.view(-1, *[1]*(x0.ndim-1))
+
+        x_t = a_t * xT + b_t * x0 + c_t * noise
+
+        _, denoised = self.denoise(
+            model,
+            x_t,
+            sigmas,
+            sar=sar,
+            opt=opt
+        )
+
+        weights = self.get_weightings(sigmas)
+        weights =  append_dims((weights), x0.ndim)
+        terms["xs_mse"] = mean_flat((denoised - x0) ** 2).mean()
+        terms["mse"] = mean_flat(weights * (denoised - x0) ** 2).mean()
+
+        if "vb" in terms:
+            terms["loss"] = terms["mse"] + terms["vb"]
+        else:
+            terms["loss"] = terms["mse"]
+
+        return terms
+
+
+    def denoise(self, model, x_t, sigmas, sar, **model_kwargs):
+        sar = sar.to(self.dtype)
+        opt = model_kwargs['opt'].to(self.dtype)
         c_skip, c_out, c_in = [
             append_dims(x, opt.ndim).to(self.dtype)
             for x in self.get_bridge_scalings(sigmas)
         ]
-        opt_t = c_skip * opt + c_out * noise
 
-        t = sigmas.to(self.dtype)
-
-        while t.ndim < model_kwargs['x0'].ndim:
-            t = t.unsqueeze(-1)
-            
-        # opt_t = (1 - t) * x0 + t * opt_t
-        xt = (opt_t, sar)
-
-        model_output, _ = self.denoise(
-            model, xt, sigmas, opt=opt_t, sar=sar
-        )
-
-        diff = model_output - x0
-        weights = self.get_weightings(sigmas).to(self.dtype)
-        while weights.ndim < diff.ndim:
-            weights = weights.unsqueeze(-1)
-        
-        prod = weights * diff.abs()
-        l1 = prod.mean()
-        return {'loss': l1}
-
-    def denoise(self, model, x_t, sigmas, **model_kwargs):
-        # print("start denoise")
-        opt_t, sar_t = x_t
-
-        c_skip, c_out, c_in = [
-            append_dims(x, opt_t.ndim).to(self.dtype)
-            for x in self.get_bridge_scalings(sigmas)
-        ]
-
+        opt_in = c_in * x_t
         rescaled_t = (1000 * 0.25 * th.log(sigmas + 1e-44)).to(self.dtype)
-        # for k, v in model_kwargs.items():
-        #     model_kwargs[k] = v.to(self.dtype)
-
-        opt_in = c_in * opt_t
-
-        model_output = model(x=opt_in, t=rescaled_t, opt=opt_in, sar=sar_t).to(self.dtype)
-        denoised     = c_out * model_output + c_skip * opt_t
-        # print("denoise return")
+        model_output = model(opt_in, rescaled_t, opt=opt_in, sar=sar).to(self.dtype)
+        model_output = model_output.clamp(-100, 100)
+        denoised     = c_out * model_output + c_skip * x_t
         return model_output, denoised
-    
+   
 
 # diffusion, model, x_t, x_0
 def karras_sample(
     diffusion,
     model,
-    x_T,
+    x_t,
     x_0,
     steps,
     clip_denoised=True,
@@ -201,32 +254,33 @@ def karras_sample(
 ):
     assert sampler in ["heun", ], 'only heun sampler is supported currently'
     
+    opt, sar = model_kwargs['opt'], model_kwargs['sar']
+    xT = (opt, sar)
+
     sigmas = get_sigmas_karras(steps, sigma_min, sigma_max-1e-4, rho, device=device)
 
-    # print("get sigmas")
     sample_fn = {
         "heun": partial(sample_heun, 
                         beta_d=diffusion.beta_d, 
                         beta_min=diffusion.beta_min),
     }[sampler]
 
-    # print("get sample_fn")
-
     sampler_args = dict(
             pred_mode=diffusion.pred_mode, churn_step_ratio=churn_step_ratio, sigma_max=sigma_max
         )
-    def denoiser(x_t, sigma):
-        _, denoised = diffusion.denoise(model, x_t, sigma, **model_kwargs)
-        
+    
+    def denoiser(x_t, sigma, sar):
+        model_kwargs_no_sar = {k: v for k, v in model_kwargs.items() if k != 'sar'}
+        _, denoised = diffusion.denoise(model, x_t, sigma, sar=sar, **model_kwargs_no_sar)
         if clip_denoised:
             denoised = denoised.clamp(-1, 1)
-                
         return denoised
     
     x_0, path, nfe = sample_fn(
         denoiser,
-        x_T,
+        x_t,
         sigmas,
+        xT=xT,
         progress=progress,
         callback=callback,
         guidance=guidance,
@@ -234,6 +288,7 @@ def karras_sample(
     )
 
     print('nfe:', nfe)
+    print("sample x_0 min/max:", x_0.min().item(), x_0.max().item())
 
     return x_0.clamp(-1, 1), [x.clamp(-1, 1) for x in path], nfe
 
@@ -256,7 +311,7 @@ def get_bridge_sigmas_karras(n, sigma_min, sigma_max, rho=7.0, eps=1e-4, device=
     sigmas_first_half = sigma_max - ((sigma_max - sigma_t_crit)  ** (1 / rho) + th.linspace(0, 1, n - n//2 +1 ) * (eps  ** (1 / rho)  - (sigma_max - sigma_t_crit)  ** (1 / rho))) ** rho
     sigmas = th.cat([sigmas_first_half.flip(0)[:-1], sigmas_second_half])
     sigmas_bridge = sigmas**2 *(1-sigmas**2/sigma_max**2)
-    return append_zero(sigmas).to(device)#, append_zero(sigmas_bridge).to(device)
+    return append_zero(sigmas_bridge).to(device)
 
 
 def to_d(x, sigma, denoised, x_T, sigma_max,   w=1, stochastic=False):
@@ -271,23 +326,19 @@ def to_d(x, sigma, denoised, x_T, sigma_max,   w=1, stochastic=False):
         return d
 
 
-def get_d_vp(x, denoised, x_T, std_t,logsnr_t, logsnr_T, logs_t, logs_T, s_t_deriv, sigma_t, sigma_t_deriv, w, stochastic=False):
-    
-    a_t = (logsnr_T - logsnr_t + logs_t - logs_T).exp()
-    b_t = -th.expm1(logsnr_T - logsnr_t) * logs_t.exp()
+def get_d_vp(x, denoised, x_T, std_t, logsnr_t, logsnr_T, logs_t, logs_T, s_t_deriv, sigma_t, sigma_t_deriv, w, stochastic=False):
+    a_t = (logsnr_T - logsnr_t + logs_t - logs_T).exp().clamp(min=1e-8, max=1e8)
+    b_t = -th.expm1(logsnr_T - logsnr_t).clamp(min=1e-8, max=1e8) * logs_t.exp().clamp(min=1e-8, max=1e8)
     
     mu_t = a_t * x_T + b_t * denoised 
     
     grad_logq = - (x - mu_t)/std_t**2 / (-th.expm1(logsnr_T - logsnr_t))
-    # grad_logpxtlx0 = - (x - logs_t.exp()*denoised)/std_t**2 
     grad_logpxTlxt = -(x - th.exp(logs_t-logs_T)*x_T) /std_t**2  / th.expm1(logsnr_t - logsnr_T)
 
     f = s_t_deriv * (-logs_t).exp() * x
     gt2 = 2 * (logs_t).exp()**2 * sigma_t * sigma_t_deriv 
-    # breakpoint()
 
     d = f -  gt2 * ((0.5 if not stochastic else 1)* grad_logq - w * grad_logpxTlxt)
-    # d = f - (0.5 if not stochastic else 1) * gt2 * (grad_logpxtlx0 - w * grad_logpxTlxt* (0 if stochastic else 1))
     if stochastic:
         return d, gt2
     else:
@@ -298,8 +349,9 @@ def get_d_vp(x, denoised, x_T, std_t,logsnr_t, logsnr_T, logs_t, logs_T, s_t_der
 @th.no_grad()
 def sample_heun(
     denoiser,
-    x_T,
+    x_t,
     sigmas,
+    xT,
     pred_mode='vp',
     progress=False,
     callback=None,
@@ -311,7 +363,6 @@ def sample_heun(
 ):
     """Deterministic Heun sampler for ODE"""
     """
-    x = (opt, sar)
     sampling with ODE. -> OPTICAL IMAGE!!!!!!!!!!!!!!!!!!!!!
     """
 
@@ -320,160 +371,42 @@ def sample_heun(
         from tqdm.auto import tqdm
         indices = tqdm(indices)
 
-    opt_T, sar = x_T
+    opt_T, sar = xT
     x = opt_T
     B = x.shape[0]
     s_in = x.new_ones([B])
     path = []
-    # path = [x.detach().cup()]
-
     nfe = 0
 
-    if pred_mode.startswith('vp'):
-        # define vp_snr, s, logs, std, etc.
-        vp_snr_sqrt_reciprocal = lambda t: (th.exp(0.5*beta_d*(t**2) + beta_min*t) - 1).sqrt()
-        s = lambda t: (1 + vp_snr_sqrt_reciprocal(t)**2).rsqrt()
-        # other VP helpers omitted for brevity
-
-    # Iterate through noise levels
     for i in range(40):
         sigma_i, sigma_j = sigmas[i], sigmas[i+1]
-        # Compute sigma_hat
-        sigma_hat = sigma_i + churn_step_ratio*(sigma_j - sigma_i)
+        sigma_hat = sigma_i + churn_step_ratio * (sigma_j - sigma_i)
 
-        # Predictor: first slope
-        denoised1 = denoiser((x, sar), sigma_hat * s_in)
-        d1 = to_d(x, sigma_hat, denoised1, opt_T, sigma_max=sigma_max, w=guidance) if pred_mode=='ve' else get_d_vp(x, denoised1, opt_T, sigma_hat, guidance)
+        denoised1 = denoiser(x, sigma_hat * s_in, sar)
+        d1 = to_d(x, sigma_hat, denoised1, opt_T, sigma_max=sigma_max, w=guidance)
+
         nfe += 1
-
         dt = sigma_j - sigma_hat
+
         if sigma_j == 0:
             x = x + d1 * dt
         else:
-            # Heun corrector
             x_mid = x + d1 * dt
-            denoised2 = denoiser((x_mid, sar), sigma_j * s_in)
-            d2 = to_d(x_mid, sigma_j, denoised2, opt_T, sigma_max=sigma_max, w=guidance) if pred_mode=='ve' else get_d_vp(x_mid, denoised2, opt_T, sigma_j, guidance)
-            x = x + 0.5*(d1 + d2) * dt
+            denoised2 = denoiser(x_mid, sigma_j * s_in, sar)
+            d2 = denoised2 - x_mid
+            x = x + 0.5 * (d1 + d2) * dt
             nfe += 1
 
-        # Callback and record
         if callback:
             callback({'x': x, 'i': i, 'sigma': sigma_i, 'sigma_hat': sigma_hat, 'denoised': denoised1})
-        # path.append(x.detach().cpu())
+
+        print(f"[{i}] x min/max: {x.min().item()} / {x.max().item()}")
+        print(f"[{i}] denoised1 min/max: {denoised1.min().item()} / {denoised1.max().item()}")
+        print(f"[{i}] d1 min/max: {d1.min().item()} / {d1.max().item()}")
+        print(f"[{i}] dt: {dt.item()}")
+        print(f"[{i}] sigma_i: {sigma_i.item()}, sigma_j: {sigma_j.item()}, sigma_hat: {sigma_hat.item()}")
 
     return x, path, nfe
-
-@th.no_grad()
-# def sample_heun(
-#     denoiser,
-#     x,
-#     sigmas,
-#     pred_mode='both',
-#     progress=False,
-#     callback=None,
-#     sigma_max=80.0,
-#     beta_d=2,
-#     beta_min=0.1,
-#     churn_step_ratio=0.,
-#     guidance=1,
-# ):
-#     """Implements Algorithm 2 (Heun steps) from Karras et al. (2022)."""
-#     x_T = x
-#     path = [x]
-    
-#     s_in = x.new_ones([x.shape[0]])
-#     indices = range(len(sigmas) - 1)
-#     if progress:
-#         from tqdm.auto import tqdm
-
-#         indices = tqdm(indices)
-
-#     nfe = 0
-#     assert churn_step_ratio < 1
-
-#     if pred_mode.startswith('vp'):
-#         vp_snr_sqrt_reciprocal = lambda t: (np.e ** (0.5 * beta_d * (t ** 2) + beta_min * t) - 1) ** 0.5
-#         vp_snr_sqrt_reciprocal_deriv = lambda t: 0.5 * (beta_min + beta_d * t) * (vp_snr_sqrt_reciprocal(t) + 1 / vp_snr_sqrt_reciprocal(t))
-#         s = lambda t: (1 + vp_snr_sqrt_reciprocal(t) ** 2).rsqrt()
-#         s_deriv = lambda t: -vp_snr_sqrt_reciprocal(t) * vp_snr_sqrt_reciprocal_deriv(t) * (s(t) ** 3)
-
-#         logs = lambda t: -0.25 * t ** 2 * (beta_d) - 0.5 * t * beta_min
-        
-#         std =  lambda t: vp_snr_sqrt_reciprocal(t) * s(t)
-        
-#         logsnr = lambda t :  - 2 * th.log(vp_snr_sqrt_reciprocal(t))
-
-#         logsnr_T = logsnr(th.as_tensor(sigma_max))
-#         logs_T = logs(th.as_tensor(sigma_max))
-    
-#     for j, i in enumerate(indices):
-        
-#         if churn_step_ratio > 0:
-#             # 1 step euler
-#             sigma_hat = (sigmas[i+1] - sigmas[i]) * churn_step_ratio + sigmas[i]
-            
-#             denoised = denoiser(x, sigmas[i] * s_in, x_T)
-#             if pred_mode == 've':
-#                 d_1, gt2 = to_d(x, sigmas[i] , denoised, x_T, sigma_max,  w=guidance, stochastic=True)
-#             elif pred_mode.startswith('vp'):
-#                 d_1, gt2 = get_d_vp(x, denoised, x_T, std(sigmas[i]),logsnr(sigmas[i]), logsnr_T, logs(sigmas[i] ), logs_T, s_deriv(sigmas[i] ), vp_snr_sqrt_reciprocal(sigmas[i] ), vp_snr_sqrt_reciprocal_deriv(sigmas[i] ), guidance, stochastic=True)
-            
-#             dt = (sigma_hat - sigmas[i]) 
-#             x = x + d_1 * dt + th.randn_like(x) *((dt).abs() ** 0.5)*gt2.sqrt()
-            
-#             nfe += 1
-            
-#             path.append(x.detach().cpu())
-#         else:
-#             sigma_hat =  sigmas[i]
-        
-#         # heun step
-#         denoised = denoiser(x, sigma_hat * s_in, x_T)
-#         if pred_mode == 've':
-#             # d =  (x - denoised ) / append_dims(sigma_hat, x.ndim)
-#             d = to_d(x, sigma_hat, denoised, x_T, sigma_max, w=guidance)
-#         elif pred_mode.startswith('vp'):
-#             d = get_d_vp(x, denoised, x_T, std(sigma_hat),logsnr(sigma_hat), logsnr_T, logs(sigma_hat), logs_T, s_deriv(sigma_hat), vp_snr_sqrt_reciprocal(sigma_hat), vp_snr_sqrt_reciprocal_deriv(sigma_hat), guidance)
-            
-#         nfe += 1
-#         if callback is not None:
-#             callback(
-#                 {
-#                     "x": x,
-#                     "i": i,
-#                     "sigma": sigmas[i],
-#                     "sigma_hat": sigma_hat,
-#                     "denoised": denoised,
-#                 }
-#             )
-#         dt = sigmas[i + 1] - sigma_hat
-#         if sigmas[i + 1] == 0:
-            
-#             x = x + d * dt 
-            
-#         else:
-#             # Heun's method
-#             x_2 = x + d * dt
-#             denoised_2 = denoiser(x_2, sigmas[i + 1] * s_in, x_T)
-#             if pred_mode == 've':
-#                 # d_2 =  (x_2 - denoised_2) / append_dims(sigmas[i + 1], x.ndim)
-#                 d_2 = to_d(x_2,  sigmas[i + 1], denoised_2, x_T, sigma_max, w=guidance)
-#             elif pred_mode.startswith('vp'):
-#                 d_2 = get_d_vp(x_2, denoised_2, x_T, std(sigmas[i + 1]),logsnr(sigmas[i + 1]), logsnr_T, logs(sigmas[i + 1]), logs_T, s_deriv(sigmas[i + 1]),
-#                                 vp_snr_sqrt_reciprocal(sigmas[i + 1]), vp_snr_sqrt_reciprocal_deriv(sigmas[i + 1]), guidance)
-            
-#             d_prime = (d + d_2) / 2
-
-#             # noise = th.zeros_like(x) if 'flow' in pred_mode or pred_mode == 'uncond' else generator.randn_like(x)
-#             x = x + d_prime * dt #+ noise * (sigmas[i + 1]**2 - sigma_hat**2).abs() ** 0.5
-#             nfe += 1
-#         # loss = (denoised.detach().cpu() - x0).pow(2).mean().item()
-#         # losses.append(loss)
-
-#         path.append(x.detach().cpu())
-        
-#     return x, path, nfe
 
 @th.no_grad()
 def forward_sample(

@@ -249,7 +249,7 @@ class TrainLoop:
 
                     logger.dumpkvs()
 
-                    self.sample_and_save(test_cond, test_target)
+                    self.sample_and_save(test_cond, test_batch)
 
                 if self.step % self.save_interval == 0:
                     self.save()
@@ -287,10 +287,16 @@ class TrainLoop:
         opt = opt_imgs.to(device=self.device, dtype=self.dtype)
         sar = sar_imgs.to(device=self.device, dtype=self.dtype)
 
-        x_start = (opt, sar)
-        sub_cond = {'opt': opt, 'sar': sar, 'x0': x0}
+        noise = th.randn_like(opt)
+        xT    = opt + self.diffusion.sigma_max * noise
+
+        sub_cond = {'opt': opt, 'sar': sar, 'x0': x0, 'xT': xT}
 
         t, weights = self.schedule_sampler.sample(opt.shape[0], device=dist_util.dev())
+        
+        if th.isnan(weights).any() or th.isinf(weights).any(): print("weights", weights)
+        if th.isnan(t).any() or th.isinf(t).any(): print("t", t)
+
         if t.dim() == 0:
             weights = weights.unsqueeze(0)
             t       = t.unsqueeze(0)
@@ -301,7 +307,6 @@ class TrainLoop:
         loss_fn = functools.partial(
             self.diffusion.training_bridge_losses,
             self.ddp_model,
-            x_start,
             t,
             model_kwargs=sub_cond,
         )
@@ -345,7 +350,11 @@ class TrainLoop:
             pass
 
         for name, val in losses.items():
-            logger.logkv(f"{prefix}{name}", float(val.item()))
+            if val.dim() > 0:
+                v = val.mean().item()
+            else:
+                v = val.item()
+            logger.logkv(f"{prefix}{name}", float(v))
                 
     def log_step(self):
         logger.logkv("step", self.step)
@@ -397,44 +406,42 @@ class TrainLoop:
 
     @th.no_grad()
     def sample_and_save(self, cond, target):
-        opt, sar = cond['opt'], cond['sar']
-        x_t = (opt, sar)
+        opt = cond['opt']
+        sar = cond['sar']
+        xT = (opt, sar)
 
-        # 1) Run the sampler with all the correct args
         sample, _, _ = karras_sample(
             diffusion      = self.diffusion,
             model          = self.model,
-            x_T            = x_t,
-            x_0            = None,                      # unused by karras_sample
-            steps          = 40,                        # or self.step?
-            progress       = False,
-            callback       = None,
-            model_kwargs   = self.sample_kwargs,
+            x_t            = xT,
+            x_0            = target,
+            steps          = 40,
+            model_kwargs   = cond,
             device         = self.device,
         )
 
-        # 2) Single scale: [-1,1] → [0,1]
         imgs = (sample + 1) * 0.5
         imgs = imgs.clamp(0, 1).cpu()
 
         out_dir = os.path.join(get_blob_logdir(), "samples")
         os.makedirs(out_dir, exist_ok=True)
 
-        # 3) Save each image
         for i, img in enumerate(imgs):
-            # if your MS bands are 13-channel, pick the 3 you want to view:
             img = img[[3, 2, 1], :, :]   # e.g. bands 4,3,2 → RGB
             fn  = os.path.join(out_dir, f"step_opt{i}.png")
-            save_image(img, fn)
+            save_image(img,
+                        fn,
+                        normalize=True)
 
-        # 4) Optionally save the GT in the same way
         if target is not None:
-            gt = (target + 1) * 0.5
+            gt = target
             gt = gt.clamp(0, 1).cpu()
             for i, img in enumerate(gt):
                 img = img[[3, 2, 1], :, :]
                 fn  = os.path.join(out_dir, f"GT_step_{i}.png")
-                save_image(img, fn)
+                save_image(img, 
+                           fn,
+                           normalize=True)
 
         print(f"[inference] saved {imgs.shape[0]} images")
 

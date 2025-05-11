@@ -133,7 +133,7 @@ def create_argparser():
         use_fp16=False,
         fp16_scale_growth=1e-3,
         debug=False,
-        num_workers=16,
+        num_workers=0,
         use_augment=False,
     )
     defaults.update(model_and_diffusion_defaults())

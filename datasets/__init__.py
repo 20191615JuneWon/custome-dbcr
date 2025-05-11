@@ -16,7 +16,6 @@ from torch.utils.data.sampler import Sampler
 
 from torch.utils.data import DataLoader, Dataset, Subset
 
-
 def get_data_scaler(config):
   """Data normalizer. Assume data are always in [0, 1]."""
   if config.data.centered:
@@ -180,95 +179,6 @@ class DistInfiniteBatchSampler(InfiniteBatchSampler):
         return local_indices
 
 
-
-
-
-
-# def load_data(
-#     data_dir,
-#     dataset,
-#     batch_size,
-#     image_size,
-#     deterministic=False,
-#     include_test=False,
-#     seed=42,
-#     num_workers=2,
-# ):
-#   # Compute batch size for this worker.
-#   root = data_dir
-  
-      
-#   if dataset == 'edges2handbags':
-     
-#     from .aligned_dataset import EdgesDataset
-#     trainset = EdgesDataset(dataroot=root, train=True, img_size= image_size,
-#                                 random_crop=True, random_flip=True)
-
-#     valset = EdgesDataset(dataroot=root, train=True, img_size= image_size,
-#                                 random_crop=False, random_flip=False)
-#     if include_test:
-#       testset = EdgesDataset(dataroot=root, train=False, img_size= image_size,
-#                                 random_crop=False, random_flip=False)
-
-#   elif dataset == 'diode':
-
-#     from .aligned_dataset import DIODE
-#     trainset = DIODE(dataroot=root, train=True, img_size=image_size,
-#                                 random_crop=True, random_flip=True, disable_cache=True)
-
-#     valset = DIODE(dataroot=root, train=True, img_size=image_size,
-#                                 random_crop=False, random_flip=False, disable_cache=True)
-
-#     if include_test:
-#       testset = DIODE(dataroot=root, train=False, img_size= image_size,
-#                                 random_crop=False, random_flip=False)
-       
-#   elif dataset =='sen12mscr':
-    
-#     from .sen12_dataset import SEN12MSCR
-#     trainset   = SEN12MSCR(root=root, split='train')
-
-#     valset     = SEN12MSCR(root=root, split='val')
-
-#     if include_test:
-#        testset = SEN12MSCR(root=root, split='test') 
-
-  
-#   loader = DataLoader(
-#       dataset=trainset, num_workers=num_workers, pin_memory=True,
-#       batch_sampler=DistInfiniteBatchSampler(
-#           dataset_len=len(trainset), glb_batch_size=batch_size*dist.get_world_size(), seed=seed,
-#           shuffle=not deterministic, filling=True, rank=dist.get_rank(), world_size=dist.get_world_size(),
-#       )
-#   )
-  
-  
-#   num_tasks = dist.get_world_size()
-#   global_rank = dist.get_rank()
-#   sampler = torch.utils.data.DistributedSampler(
-#           valset, num_replicas=num_tasks, rank=global_rank, shuffle=False, drop_last=False
-#       )
-#   val_loader = torch.utils.data.DataLoader(
-#     valset, batch_size=batch_size,
-#     sampler=sampler, num_workers=num_workers,  drop_last=False)
-  
-#   if include_test:
-      
-#     num_tasks = dist.get_world_size()
-#     global_rank = dist.get_rank()
-#     sampler = torch.utils.data.DistributedSampler(
-#             testset, num_replicas=num_tasks, rank=global_rank, shuffle=False, drop_last=False
-#         )
-#     test_loader = torch.utils.data.DataLoader(
-#       testset, batch_size=batch_size,
-#       sampler=sampler, num_workers=num_workers,  shuffle=False,drop_last=False)
-    
-#     return loader, val_loader, test_loader
-#   else:
-#     return loader, val_loader
-  
-
-
 def load_data(
     frac,
     seed,
@@ -292,6 +202,7 @@ def load_data(
     subset_indices = idx[:subset_size].tolist()
     trainset = Subset(trainset, subset_indices)
 
+
     def collate_fn(batch):
         sar    = torch.stack([item['input']['S1']  for item in batch], dim=0)
         opt    = torch.stack([item['input']['S2']  for item in batch], dim=0)
@@ -303,7 +214,7 @@ def load_data(
         batch_size=batch_size,
         shuffle=True,
         generator=shuffle_gen,
-        num_workers=16,
+        num_workers=num_workers, 
         pin_memory=True,
         collate_fn=collate_fn,
     )
@@ -312,7 +223,7 @@ def load_data(
         dataset=valset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=16,
+        num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_fn,
     )

@@ -17,9 +17,9 @@ def model_and_diffusion_defaults():
         sigma_data=0.5,
         sigma_min=0.002,
         sigma_max=80.0,
-        beta_d=2.0,
+        beta_d=2,
         beta_min=0.1,
-        cov_xy=0.0,
+        cov_xy=0.,
 
         image_size=256,
         in_channels=13,                   # Sentinel-2 13개 밴드
@@ -35,7 +35,7 @@ def model_and_diffusion_defaults():
         use_scale_shift_norm=True,
         use_fp16=False,
 
-        pred_mode="ve",                   # VE bridge
+        pred_mode="vp",                   # VE bridge
         weight_schedule="karras",
         rho=7.0,                          # Karras rho
     )
@@ -94,9 +94,9 @@ def create_model_and_diffusion(
     sigma_data=0.5,
     sigma_min=0.002,
     sigma_max=80.0,
-    beta_d=2.0,
+    beta_d=2,
     beta_min=0.1,
-    cov_xy=0.0,
+    cov_xy=0.,
     pred_mode="ve",
     weight_schedule="karras",
     rho=7.0,

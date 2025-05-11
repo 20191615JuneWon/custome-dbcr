@@ -71,6 +71,7 @@ class UniformSampler(ScheduleSampler):
     def weights(self):
         return self._weights
 
+
 class RealUniformSampler:
     def __init__(self, diffusion):
         self.diffusion = diffusion
