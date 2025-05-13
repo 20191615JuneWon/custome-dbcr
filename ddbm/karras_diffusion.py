@@ -173,9 +173,8 @@ class KarrasDenoiser(nn.Module):
             noise = th.randn_like(x0)
 
         sigmas = th.minimum(sigmas, th.ones_like(sigmas)* self.sigma_max)
-        sigmas = sigmas.clamp(min=self.sigma_min, max=self.sigma_max)
 
-        xT = opt + self.sigma_max * noise
+        xT = x0 + self.sigma_max * noise
         terms = {}
 
         t = sigmas
@@ -228,7 +227,6 @@ class KarrasDenoiser(nn.Module):
         opt_in = c_in * x_t
         rescaled_t = (1000 * 0.25 * th.log(sigmas + 1e-44)).to(self.dtype)
         model_output = model(opt_in, rescaled_t, opt=opt_in, sar=sar).to(self.dtype)
-        model_output = model_output.clamp(-100, 100)
         denoised     = c_out * model_output + c_skip * x_t
         return model_output, denoised
    
@@ -254,7 +252,10 @@ def karras_sample(
 ):
     assert sampler in ["heun", ], 'only heun sampler is supported currently'
     
-    opt, sar = model_kwargs['opt'], model_kwargs['sar']
+    opt = model_kwargs['opt']
+    sar = model_kwargs['sar']
+    x0 = x_0
+
     xT = (opt, sar)
 
     sigmas = get_sigmas_karras(steps, sigma_min, sigma_max-1e-4, rho, device=device)
@@ -269,9 +270,8 @@ def karras_sample(
             pred_mode=diffusion.pred_mode, churn_step_ratio=churn_step_ratio, sigma_max=sigma_max
         )
     
-    def denoiser(x_t, sigma, sar):
-        model_kwargs_no_sar = {k: v for k, v in model_kwargs.items() if k != 'sar'}
-        _, denoised = diffusion.denoise(model, x_t, sigma, sar=sar, **model_kwargs_no_sar)
+    def denoiser(x_t, sigma):
+        _, denoised = diffusion.denoise(model, x_t, sigma, opt=opt, sar=sar, x0=x0)
         if clip_denoised:
             denoised = denoised.clamp(-1, 1)
         return denoised
@@ -352,48 +352,41 @@ def sample_heun(
     x_t,
     sigmas,
     xT,
-    pred_mode='vp',
+    churn_step_ratio=0.,
+    guidance=1,
+    clip_denoised=True,
     progress=False,
     callback=None,
     sigma_max=80.0,
-    beta_d=2,
-    beta_min=0.1,
-    churn_step_ratio=0.,
-    guidance=1,
 ):
-    """Deterministic Heun sampler for ODE"""
-    """
-    sampling with ODE. -> OPTICAL IMAGE!!!!!!!!!!!!!!!!!!!!!
-    """
-
-    indices = range(len(sigmas) - 1)
-    if progress:
-        from tqdm.auto import tqdm
-        indices = tqdm(indices)
 
     opt_T, sar = xT
     x = opt_T
-    B = x.shape[0]
-    s_in = x.new_ones([B])
+    
+    indices = range(len(sigmas)-1)
+    if progress:
+        from tqdm.auto import tqdm
+        indices = tqdm(indices)
+    
     path = []
     nfe = 0
+    B = x.shape[0]
 
-    for i in range(40):
+    for i in indices:
         sigma_i, sigma_j = sigmas[i], sigmas[i+1]
         sigma_hat = sigma_i + churn_step_ratio * (sigma_j - sigma_i)
 
-        denoised1 = denoiser(x, sigma_hat * s_in, sar)
+        denoised1 = denoiser(x, sigma_hat, sar)
         d1 = to_d(x, sigma_hat, denoised1, opt_T, sigma_max=sigma_max, w=guidance)
-
         nfe += 1
-        dt = sigma_j - sigma_hat
 
+        dt = sigma_j - sigma_hat
         if sigma_j == 0:
             x = x + d1 * dt
         else:
             x_mid = x + d1 * dt
-            denoised2 = denoiser(x_mid, sigma_j * s_in, sar)
-            d2 = denoised2 - x_mid
+            denoised2 = denoiser(x_mid, sigma_j, sar)
+            d2 = to_d(x_mid, sigma_j, denoised2, opt_T, sigma_max, w=guidance)
             x = x + 0.5 * (d1 + d2) * dt
             nfe += 1
 
@@ -406,6 +399,7 @@ def sample_heun(
         print(f"[{i}] dt: {dt.item()}")
         print(f"[{i}] sigma_i: {sigma_i.item()}, sigma_j: {sigma_j.item()}, sigma_hat: {sigma_hat.item()}")
 
+        x = x.clamp(-1, 1)
     return x, path, nfe
 
 @th.no_grad()

@@ -27,7 +27,6 @@ from .nn import (
 # Based on QKVAttention (unet.py by NVIDIA)
 # Q from Optical, KV from SAR. need to concat it before send it to SFBlock
 
-
 class SimpleGate(nn.Module):
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
@@ -48,6 +47,65 @@ class SqueezeExcite(nn.Module):
     def forward(self, x):
         pooled = self.pool(x)
         return x * self.fc(pooled.to(x.dtype))
+
+# TODO:
+class RGBBlock(nn.Module):
+    def __init__(self, channels, num_heads=4, dims=2):
+        super().__init__()
+        assert channels % num_heads == 0, "channels must be divisible by num_heads"
+        
+        self.channels  = channels
+        self.num_heads = num_heads
+        self.head_dim  = channels // num_heads  # 채널 수를 헤드 개수로 나눠서 각 헤드 차원 설정
+        
+        self.norm_q  = normalization(1)
+        self.norm_kv = normalization(2)
+
+        self.q_proj = conv_nd(dims, 1, channels, 1)
+        self.k_proj = conv_nd(dims, 2, channels, 1)
+        self.v_proj = conv_nd(dims, 2, channels, 1)
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+        
+        self.out_proj = zero_module(conv_nd(dims, channels, channels, 1))
+
+    def forward(self, feat_opt):
+        B, _, H, W = feat_opt.shape   # C=3
+        HW = H * W
+
+        b_channel  = feat_opt[:, 2:3, :, :]
+        RG_channel = feat_opt[:, 0:2, :, :]
+
+        q = self.q_proj(self.norm_q(b_channel)).to(feat_opt.dtype)
+        k = self.k_proj(self.norm_kv(RG_channel)).to(feat_opt.dtype)
+        v = self.v_proj(self.norm_kv(RG_channel)).to(feat_opt.dtype)
+
+        q = q.view(B, self.channels, HW)
+        k = k.view(B, self.channels, HW)
+        v = v.view(B, self.channels, HW)
+
+        q_h = q.view(B, self.num_heads, self.head_dim, HW)
+        k_h = k.view(B, self.num_heads, self.head_dim, HW)
+        v_h = v.view(B, self.num_heads, self.head_dim, HW)
+
+        scale = self.head_dim ** -0.5
+        attn = th.matmul(q_h, k_h.transpose(-2, -1)) * scale
+        attn = F.softmax(attn, dim=-1)
+        out_h = th.matmul(attn, v_h)
+
+        out = out_h.view(B, self.channels, HW)
+
+        out = out.permute(0, 2, 1).reshape(B*HW, self.channels)
+        out = self.mlp(out)
+        out = out.view(B, HW, self.channels).permute(0, 2, 1)
+
+        out = out.view(B, self.channels, H, W) + feat_opt
+        return self.out_proj(out)
+
 
 
 class MBConv(nn.Module):
@@ -99,36 +157,9 @@ class MBConv(nn.Module):
         return x_in + h if self.use_residual else h
 
 
-'''
-Basic Architecture
 
-1. LN (Layer Norm)
-2. MBConv
-3. + X
-4. LN (Layer Norm)
-5. FFN
-6. + Z
-7. Simple Gat
-
-*** PARAMETERS *** 
-
-- we dont use multi-head attention. (n_heads = 1)
-- QKV from Optical + SAR 
-
-encoder_kv 
-- Upper the if (about encoder_kv), Code is talking about Self-attention (* 3)
-- but we only use kv from SAR (it means -> * 2)
-
-after coding, we can rewrite it briefly
-
-- bs: bench_size, k = key, v = value
-'''
 class SFBlock(nn.Module):
-    """
-    Channel-wise cross-attention fusion block.
-    Q from optical branch, K/V from SAR branch.
-    Computes C×C attention over channels.
-    """
+
     def __init__(self, channels, num_heads=4, mlp_ratio=2, dims=2):
         super().__init__()
         assert channels % num_heads == 0
@@ -207,41 +238,7 @@ class SFBlock(nn.Module):
         # 6) reshape to (B,C,H,W), residual + final conv
         out = out.reshape(B, C, H, W) + feat_opt
         return self.out_proj(out)
-'''
-NAFBlock
 
-rewriting it (as NVIDIA style)
-
-- SimpleGate
-- LayerNorm
-- NAFBlock
-
-From Residual Block (NVIDIA)
-    A residual block that can optionally change the number of channels.
-
-    :param channels: the number of input channels.
-    :param emb_channels: the number of timestep embedding channels.
-    :param dropout: the rate of dropout.
-    :param out_channels: if specified, the number of out channels.
-    :param use_conv: if True and out_channels is specified, use a spatial
-        convolution instead of a smaller 1x1 convolution to change the
-        channels in the skip connection.
-    :param dims: determines if the signal is 1D, 2D, or 3D.
-    :param use_checkpoint: if True, use gradient checkpointing on this module.
-    :param up: if True, use this block for upsampling.
-    :param down: if True, use this block for downsampling.
-
-
-Basic Architecture
-
-1. LN (Layer Norm)
-2. MBConv
-3. + X
-4. LN (Layer Norm)
-5. FFN
-6. + Z
-7. Simple Gate
-'''
 class NAFBlock(nn.Module):
     """
     1. LN → MBConv → +X
@@ -310,10 +307,34 @@ class NAFBlock(nn.Module):
         return x1 + h2
 
 
+
+class BlueScaler(nn.Module):
+    def __init__(self, num_channels=13, blue_idx=1):
+
+        super().__init__()
+        assert 0 <= blue_idx < num_channels
+        self.num_channels = num_channels
+        self.blue_idx = blue_idx
+        self.scale_blue = nn.Parameter(th.tensor(1.0))
+
+    def forward(self, x):
+
+        B, C, H, W = x.shape
+        assert C == self.num_channels, \
+            f"Expected {self.num_channels} channels but got {C}"
+        
+        scale = x.new_ones((1, C, 1, 1))
+        scale[:, self.blue_idx, :, :] = self.scale_blue
+        
+        return x * scale
+        
+
+    
+
 class NAFUNetModel(nn.Module):
     def __init__(
         self,
-        in_channels=13,    # 13 -> 3 
+        in_channels=13,
         sar_channels=2,
         out_channels=13,
         model_channels=22,
@@ -329,18 +350,15 @@ class NAFUNetModel(nn.Module):
         super().__init__()
         self.dtype = th.float16 if use_fp16 else th.float32
 
-        # time‑embed dimension, 22
+        self.scaler = BlueScaler()
         self.emb_channels = model_channels
 
-        # 3x3 input embeddings
         self.opt_embed = conv_nd(dims, in_channels, model_channels, 3, padding=1)
         self.sar_embed = conv_nd(dims, sar_channels, model_channels, 3, padding=1)
 
-        # compute channels at each level
         self.channel_list = [model_channels * m for m in channel_mult]
         self.num_levels   = len(self.channel_list)
 
-        # 1) encoders and fusion modules
         self.encoder_opt      = nn.ModuleList()
         self.encoder_sar      = nn.ModuleList()
         self.fusion_blocks    = nn.ModuleList()
@@ -348,7 +366,6 @@ class NAFUNetModel(nn.Module):
         self.downsamples_sar  = nn.ModuleList()
 
         for lvl, ch in enumerate(self.channel_list):
-            # stack of NAFBlocks
             self.encoder_opt.append(nn.Sequential(*[
                 NAFBlock(ch, dropout, dims, use_checkpoint, emb_channels=self.emb_channels)
                 for _ in range(num_naf_blocks)
@@ -358,12 +375,10 @@ class NAFUNetModel(nn.Module):
                 for _ in range(num_naf_blocks)
             ]))
 
-            # fusion SFBlock defined elsewhere
             self.fusion_blocks.append(
                 SFBlock(ch, num_heads=num_heads_per_level[lvl], dims=dims)
             )
 
-            # downsample except last
             if lvl < self.num_levels-1:
                 self.downsamples_opt.append(
                     Downsample(ch, use_conv=conv_resample, dims=dims)
@@ -372,11 +387,9 @@ class NAFUNetModel(nn.Module):
                     Downsample(ch, use_conv=conv_resample, dims=dims)
                 )
 
-        # 2) middle
         mid_ch = self.channel_list[-1]
         self.middle_block = NAFBlock(mid_ch, dropout, dims, use_checkpoint, emb_channels=self.emb_channels)
 
-        # 3) decoder (optical only)
         self.decoder   = nn.ModuleList()
         self.upsamples = nn.ModuleList()
         for lvl, ch in enumerate(reversed(self.channel_list)):
@@ -388,10 +401,8 @@ class NAFUNetModel(nn.Module):
                     Upsample(ch, use_conv=conv_resample, dims=dims)
                 )
 
-        # 4) final output conv
         self.out = zero_module(conv_nd(dims, model_channels, out_channels, 1))
 
-        # convert to fp16 if requested
         if use_fp16:
             self.convert_to_fp16()
 
@@ -407,82 +418,34 @@ class NAFUNetModel(nn.Module):
             m.float()
 
     def forward(self, x, t, opt, sar):
-        # x: noisy cloudy input (unused here, we start from y directly)
-        # t: time steps, opt: optical cloudy, sar: SAR
-        dtype = self.dtype
+        
+        t   = t.to(self.dtype)
+        opt = opt.to(self.dtype)
+        sar = sar.to(self.dtype)
 
-        # Dataset
-        # debug_stats("opt (in)", opt)
-        # debug_stats("sar (in)", sar)
+        t_emb = timestep_embedding(t, dim=self.emb_channels).to(self.dtype)
+        
+        # TODO:
+        opt = self.scaler(opt)
 
-        # debug_stats("opt_embed.W", self.opt_embed.weight)
-        # if self.opt_embed.bias is not None:
-        #     debug_stats("opt_embed.b", self.opt_embed.bias)
-        # debug_stats("sar_embed.W", self.sar_embed.weight)
-        # if self.sar_embed.bias is not None:
-        #     debug_stats("sar_embed.b", self.sar_embed.bias)
+        h_opt = self.opt_embed(opt)
+        h_sar = self.sar_embed(sar)
 
-        # embed time once
-        t_emb = timestep_embedding(t.to(dtype), dim=self.emb_channels).to(dtype)
-        # debug_stats("t_emb", t_emb)
-
-        # embed inputs
-        try:
-            h_opt = self.opt_embed(opt.to(dtype))
-        except Exception as e:
-            # print("[ERROR] opt_embed conv failed:", e)
-            raise
-        # debug_stats("h_opt after emb", h_opt)
-
-        try:
-            h_sar = self.sar_embed(sar.to(dtype))
-        except Exception as e:
-            # print("[ERROR] sar_embed conv failed:", e)
-            raise
-        # debug_stats("h_sar after emb", h_sar)
-
-        # encoder + fusion
         for lvl in range(self.num_levels):
-            # modality‑specific NAFBlocks (with time emb)
             for blk in self.encoder_opt[lvl]:
                 h_opt = blk(h_opt, t_emb)
             for blk in self.encoder_sar[lvl]:
                 h_sar = blk(h_sar, t_emb)
 
-            # cross‑modal fusion
             h_opt = self.fusion_blocks[lvl](h_opt, h_sar)
-            # debug_stats(f"h_opt after fusion{lvl}", h_opt)
-
-            # downsample if not last
             if lvl < self.num_levels-1:
                 h_opt = self.downsamples_opt[lvl](h_opt)
                 h_sar = self.downsamples_sar[lvl](h_sar)
-        # middle
+
         h = self.middle_block(h_opt, t_emb)
-        # decoder (only optical path)
         for i, dec in enumerate(self.decoder):
             h = dec(h, t_emb)
             if i < len(self.upsamples):
                 h = self.upsamples[i](h)
-        # debug_stats("pre-out h", h)
 
-        out = self.out(h)
-        # debug_stats("final out", out)
-
-        # final projection
-        return out
-
-
-
-# def debug_stats(name, x):
-#     """ Tensor x 의 shape, dtype, min/max, NaN/Inf 여부를 출력 """
-#     with th.no_grad():
-#         x_cpu = x.detach().float().cpu()
-#         mn = x_cpu.min().item()
-#         mx = x_cpu.max().item()
-#         has_nan = th.isnan(x_cpu).any().item()
-#         has_inf = th.isinf(x_cpu).any().item()
-#     # tuple(x.shape) → 문자열로 바꿔서 출력
-#     shape_str = str(tuple(x.shape))
-#     print(f"[DEBUG] {name:12s} shape={shape_str:15s} dtype={str(x.dtype):7s}"
-#           f" min/max=({mn:.6g},{mx:.6g}) nan={has_nan} inf={has_inf}")
+        return self.out(h)

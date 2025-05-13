@@ -205,8 +205,7 @@ class TrainLoop:
             dist.barrier()
 
     def preprocess(self, x):
-        if x.shape[1] == 3:
-            x =  x * 2 - 1                
+        x =  x * 2 - 1                
         return x
 
     def run_loop(self):
@@ -279,23 +278,16 @@ class TrainLoop:
         if train:
             self.mp_trainer.zero_grad()
 
-        gt_imgs    = batch
-        opt_imgs   = cond['opt']
-        sar_imgs   = cond['sar']
-
-        x0  = gt_imgs.to(device=self.device, dtype=self.dtype)
-        opt = opt_imgs.to(device=self.device, dtype=self.dtype)
-        sar = sar_imgs.to(device=self.device, dtype=self.dtype)
+        x0    = batch.to(device=self.device, dtype=self.dtype)
+        opt   = cond['opt'].to(device=self.device, dtype=self.dtype)
+        sar   = cond['sar'].to(device=self.device, dtype=self.dtype)
 
         noise = th.randn_like(opt)
-        xT    = opt + self.diffusion.sigma_max * noise
+        xT    = x0 + self.diffusion.sigma_max * noise
 
         sub_cond = {'opt': opt, 'sar': sar, 'x0': x0, 'xT': xT}
 
         t, weights = self.schedule_sampler.sample(opt.shape[0], device=dist_util.dev())
-        
-        if th.isnan(weights).any() or th.isinf(weights).any(): print("weights", weights)
-        if th.isnan(t).any() or th.isinf(t).any(): print("t", t)
 
         if t.dim() == 0:
             weights = weights.unsqueeze(0)
@@ -309,6 +301,7 @@ class TrainLoop:
             self.ddp_model,
             t,
             model_kwargs=sub_cond,
+            noise=noise
         )
 
         if train and not self.use_ddp:
@@ -326,6 +319,7 @@ class TrainLoop:
         self._log_losses(t, losses, prefix='' if train else 'test_')
         if train:
             self.mp_trainer.backward(loss)
+
 
 
     def _update_ema(self):
@@ -406,44 +400,67 @@ class TrainLoop:
 
     @th.no_grad()
     def sample_and_save(self, cond, target):
-        opt = cond['opt']
-        sar = cond['sar']
-        xT = (opt, sar)
+        device = self.device
+        dtype  = self.dtype
 
-        sample, _, _ = karras_sample(
-            diffusion      = self.diffusion,
-            model          = self.model,
-            x_t            = xT,
-            x_0            = target,
-            steps          = 40,
-            model_kwargs   = cond,
-            device         = self.device,
+        opt = cond['opt'].to(device=device, dtype=dtype)
+        sar = cond['sar'].to(device=device, dtype=dtype)
+
+        if target is None:
+            raise ValueError("`target` (MS ground truth) must be provided for sampling.")
+        ms_shape = target.shape
+        x_t = th.randn(ms_shape, device=device, dtype=dtype) * self.diffusion.sigma_max
+
+        sample, path, nfe = karras_sample(
+            diffusion    = self.diffusion,
+            model        = self.model,
+            x_t          = x_t,
+            x_0          = target.to(device, dtype),  
+            steps        = 40,
+            clip_denoised= True,
+            progress     = False,
+            model_kwargs = {'opt': opt, 'sar': sar},
+            device       = device,
         )
 
-        imgs = (sample + 1) * 0.5
-        imgs = imgs.clamp(0, 1).cpu()
+        sample = (sample + 1) * 0.5
+        sample = sample.clamp(0, 1).cpu()
 
         out_dir = os.path.join(get_blob_logdir(), "samples")
         os.makedirs(out_dir, exist_ok=True)
 
-        for i, img in enumerate(imgs):
-            img = img[[3, 2, 1], :, :]   # e.g. bands 4,3,2 → RGB
-            fn  = os.path.join(out_dir, f"step_opt{i}.png")
-            save_image(img,
-                        fn,
-                        normalize=True)
+        B, C_ms, H, W = sample.shape
 
-        if target is not None:
-            gt = target
-            gt = gt.clamp(0, 1).cpu()
-            for i, img in enumerate(gt):
-                img = img[[3, 2, 1], :, :]
-                fn  = os.path.join(out_dir, f"GT_step_{i}.png")
-                save_image(img, 
-                           fn,
-                           normalize=True)
+        for i in range(B):
+            img_ms = sample[i]
+            rgb = img_ms[[3, 2, 1], :, :]
+            fn = os.path.join(out_dir, f"sample_ms_{i}.png")
+            save_image(rgb, fn, normalize=False)
 
-        print(f"[inference] saved {imgs.shape[0]} images")
+        opt_vis = (opt + 1) * 0.5
+        opt_vis = opt_vis.clamp(0, 1).cpu()
+        for i in range(opt_vis.shape[0]):
+            img_opt = opt_vis[i]
+            fn = os.path.join(out_dir, f"input_opt_{i}.png")
+            save_image(img_opt, fn, normalize=False)
+
+        sar_vis = sar.clamp(0, 1).cpu()
+        for i in range(sar_vis.shape[0]):
+            for b in range(sar_vis.shape[1]):
+                img_sar = sar_vis[i, b : b+1, :, :]
+                fn = os.path.join(out_dir, f"input_sar_{i}_band{b}.png")
+                save_image(img_sar, fn, normalize=True)
+
+        gt = (target + 1) * 0.5
+        gt = gt.clamp(0, 1).cpu()
+        for i in range(gt.shape[0]):
+            img_gt = gt[i]
+            rgb = img_gt[[3, 2, 1], :, :]
+            fn = os.path.join(out_dir, f"gt_ms_{i}.png")
+            save_image(rgb, fn, normalize=False)
+
+        print(f"[inference] nfe={nfe}, saved {B} samples to {out_dir}")
+
 
 
 
