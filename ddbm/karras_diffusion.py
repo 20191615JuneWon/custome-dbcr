@@ -174,7 +174,7 @@ class KarrasDenoiser(nn.Module):
 
         sigmas = th.minimum(sigmas, th.ones_like(sigmas)* self.sigma_max)
 
-        xT = x0 + self.sigma_max * noise
+        xT = opt + self.sigma_max * noise
         terms = {}
 
         t = sigmas
@@ -224,7 +224,7 @@ class KarrasDenoiser(nn.Module):
             for x in self.get_bridge_scalings(sigmas)
         ]
 
-        opt_in = c_in * opt
+        opt_in = c_in * x_t
         rescaled_t = (1000 * 0.25 * th.log(sigmas + 1e-44)).to(self.dtype)
         model_output = model(opt_in, rescaled_t, opt=opt_in, sar=sar).to(self.dtype)
         denoised     = c_out * model_output + c_skip * x_t
