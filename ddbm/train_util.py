@@ -127,7 +127,7 @@ class TrainLoop:
                 output_device=dist_util.dev(),
                 broadcast_buffers=False,
                 bucket_cap_mb=128,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
             )
         else:
             if dist.get_world_size() > 1:
@@ -211,9 +211,10 @@ class TrainLoop:
     def run_loop(self):
         while True:
             for (opt, sar), target in self.data:
+                # TODO:
                 if self.step >= self.total_training_steps:
                     (test_opt, test_sar), test_target = next(iter(self.test_data))
-                    test_target = self.preprocess(test_target).to(device=self.device, dtype=self.dtype)
+                    test_target = test_target.to(device=self.device, dtype=self.dtype)
                     test_opt    = self.preprocess(test_opt).to(device=self.device, dtype=self.dtype)
                     test_sar    = self.preprocess(test_sar).to(device=self.device, dtype=self.dtype)
                     
@@ -224,7 +225,7 @@ class TrainLoop:
                         self.save()
                     return
 
-                target = self.preprocess(target).to(device=self.device, dtype=self.dtype)
+                target = target.to(device=self.device, dtype=self.dtype)
                 opt    = self.preprocess(opt).to(device=self.device, dtype=self.dtype)
                 sar    = self.preprocess(sar).to(device=self.device, dtype=self.dtype)
 
@@ -238,7 +239,7 @@ class TrainLoop:
                 if self.step % self.sample_interval == 0:
                     (test_opt, test_sar), test_target = next(iter(self.test_data))
 
-                    test_target = self.preprocess(test_target).to(device=self.device, dtype=self.dtype)
+                    test_target = test_target.to(device=self.device, dtype=self.dtype)
                     test_opt    = self.preprocess(test_opt).to(device=self.device, dtype=self.dtype)
                     test_sar    = self.preprocess(test_sar).to(device=self.device, dtype=self.dtype)
 
@@ -408,13 +409,15 @@ class TrainLoop:
 
         if target is None:
             raise ValueError("`target` (MS ground truth) must be provided for sampling.")
+        
         ms_shape = target.shape
         x_t = th.randn(ms_shape, device=device, dtype=dtype) * self.diffusion.sigma_max
 
+        opt_noise = opt + x_t
         sample, path, nfe = karras_sample(
             diffusion    = self.diffusion,
             model        = self.model,
-            x_t          = x_t,
+            x_t          = opt_noise,
             x_0          = target.to(device, dtype),  
             steps        = 40,
             clip_denoised= True,
@@ -429,35 +432,36 @@ class TrainLoop:
         out_dir = os.path.join(get_blob_logdir(), "samples")
         os.makedirs(out_dir, exist_ok=True)
 
-        B, C_ms, H, W = sample.shape
+        B, _, _, _ = sample.shape
 
         for i in range(B):
             img_ms = sample[i]
             rgb = img_ms[[3, 2, 1], :, :]
             fn = os.path.join(out_dir, f"sample_ms_{i}.png")
-            save_image(rgb, fn, normalize=False)
+            save_image(rgb, fn, normalize=True)
 
         opt_vis = (opt + 1) * 0.5
         opt_vis = opt_vis.clamp(0, 1).cpu()
-        for i in range(opt_vis.shape[0]):
+        for i in range(B):
             img_opt = opt_vis[i]
+            img_opt = img_opt[[3, 2, 1], :, :]
             fn = os.path.join(out_dir, f"input_opt_{i}.png")
-            save_image(img_opt, fn, normalize=False)
+            save_image(img_opt, fn, normalize=True)
 
-        sar_vis = sar.clamp(0, 1).cpu()
-        for i in range(sar_vis.shape[0]):
-            for b in range(sar_vis.shape[1]):
-                img_sar = sar_vis[i, b : b+1, :, :]
-                fn = os.path.join(out_dir, f"input_sar_{i}_band{b}.png")
-                save_image(img_sar, fn, normalize=True)
+        # sar_vis = sar.clamp(0, 1).cpu()
+        # for i in range(sar_vis.shape[0]):
+        #     for b in range(sar_vis.shape[1]):
+        #         img_sar = sar_vis[i, b : b+1, :, :]
+        #         fn = os.path.join(out_dir, f"input_sar_{i}_band{b}.png")
+        #         save_image(img_sar, fn, normalize=True)
 
-        gt = (target + 1) * 0.5
+        gt = target
         gt = gt.clamp(0, 1).cpu()
-        for i in range(gt.shape[0]):
+        for i in range(B):
             img_gt = gt[i]
             rgb = img_gt[[3, 2, 1], :, :]
-            fn = os.path.join(out_dir, f"gt_ms_{i}.png")
-            save_image(rgb, fn, normalize=False)
+            fn = os.path.join(out_dir, f"gt_{i}.png")
+            save_image(rgb, fn, normalize=True)
 
         print(f"[inference] nfe={nfe}, saved {B} samples to {out_dir}")
 

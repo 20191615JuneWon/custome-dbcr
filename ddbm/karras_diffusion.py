@@ -224,7 +224,7 @@ class KarrasDenoiser(nn.Module):
             for x in self.get_bridge_scalings(sigmas)
         ]
 
-        opt_in = c_in * x_t
+        opt_in = c_in * opt
         rescaled_t = (1000 * 0.25 * th.log(sigmas + 1e-44)).to(self.dtype)
         model_output = model(opt_in, rescaled_t, opt=opt_in, sar=sar).to(self.dtype)
         denoised     = c_out * model_output + c_skip * x_t
@@ -254,43 +254,35 @@ def karras_sample(
     
     opt = model_kwargs['opt']
     sar = model_kwargs['sar']
-    x0 = x_0
-
-    xT = (opt, sar)
 
     sigmas = get_sigmas_karras(steps, sigma_min, sigma_max-1e-4, rho, device=device)
+  
+    def denoiser(x, sigma):
+        B = x.shape[0]
+        sigma = x.new_full([B], float(sigma)) if sigma.dim()==0 else sigma.expand(B)
+        _, den = diffusion.denoise(model, x, sigma, opt=opt, sar=sar, x0=x_0)
+        return den.clamp(-1,1) if clip_denoised else den
+        
 
-    sample_fn = {
-        "heun": partial(sample_heun, 
-                        beta_d=diffusion.beta_d, 
-                        beta_min=diffusion.beta_min),
-    }[sampler]
-
+    sample_fn = sample_heun
     sampler_args = dict(
-            pred_mode=diffusion.pred_mode, churn_step_ratio=churn_step_ratio, sigma_max=sigma_max
+            churn_step_ratio=churn_step_ratio, 
+            sigma_max=sigma_max
         )
-    
-    def denoiser(x_t, sigma):
-        _, denoised = diffusion.denoise(model, x_t, sigma, opt=opt, sar=sar, x0=x0)
-        if clip_denoised:
-            denoised = denoised.clamp(-1, 1)
-        return denoised
-    
-    x_0, path, nfe = sample_fn(
+    sample, path, nfe = sample_fn(
         denoiser,
         x_t,
         sigmas,
-        xT=xT,
+        guidance=guidance,
         progress=progress,
         callback=callback,
-        guidance=guidance,
         **sampler_args,
     )
 
     print('nfe:', nfe)
-    print("sample x_0 min/max:", x_0.min().item(), x_0.max().item())
+    print("sample x_0 min/max:", sample.min().item(), sample.max().item())
 
-    return x_0.clamp(-1, 1), [x.clamp(-1, 1) for x in path], nfe
+    return sample.clamp(-1, 1), path, nfe
 
 
 def get_sigmas_karras(n, sigma_min, sigma_max, rho=7.0, device="cpu"):
@@ -349,19 +341,14 @@ def get_d_vp(x, denoised, x_T, std_t, logsnr_t, logsnr_T, logs_t, logs_T, s_t_de
 @th.no_grad()
 def sample_heun(
     denoiser,
-    x_t,
+    x,
     sigmas,
-    xT,
     churn_step_ratio=0.,
     guidance=1,
-    clip_denoised=True,
     progress=False,
     callback=None,
     sigma_max=80.0,
 ):
-
-    opt_T, sar = xT
-    x = opt_T
     
     indices = range(len(sigmas)-1)
     if progress:
@@ -370,14 +357,14 @@ def sample_heun(
     
     path = []
     nfe = 0
-    B = x.shape[0]
+    B = x.size(0)
 
     for i in indices:
         sigma_i, sigma_j = sigmas[i], sigmas[i+1]
         sigma_hat = sigma_i + churn_step_ratio * (sigma_j - sigma_i)
-
-        denoised1 = denoiser(x, sigma_hat, sar)
-        d1 = to_d(x, sigma_hat, denoised1, opt_T, sigma_max=sigma_max, w=guidance)
+        
+        denoised1 = denoiser(x, sigma_hat)
+        d1 = to_d(x, sigma_hat, denoised1, x, sigma_max=sigma_max, w=guidance)
         nfe += 1
 
         dt = sigma_j - sigma_hat
@@ -385,8 +372,8 @@ def sample_heun(
             x = x + d1 * dt
         else:
             x_mid = x + d1 * dt
-            denoised2 = denoiser(x_mid, sigma_j, sar)
-            d2 = to_d(x_mid, sigma_j, denoised2, opt_T, sigma_max, w=guidance)
+            denoised2 = denoiser(x_mid, sigma_j)
+            d2 = to_d(x_mid, sigma_j, denoised2, x, sigma_max, w=guidance)
             x = x + 0.5 * (d1 + d2) * dt
             nfe += 1
 

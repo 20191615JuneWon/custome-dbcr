@@ -418,7 +418,7 @@ class NAFUNetModel(nn.Module):
             m.float()
 
     def forward(self, x, t, opt, sar):
-        
+        self.dtype = opt
         t   = t.to(self.dtype)
         opt = opt.to(self.dtype)
         sar = sar.to(self.dtype)
@@ -426,7 +426,7 @@ class NAFUNetModel(nn.Module):
         t_emb = timestep_embedding(t, dim=self.emb_channels).to(self.dtype)
         
         # TODO:
-        opt = self.scaler(opt)
+        # opt = self.scaler(opt)
 
         h_opt = self.opt_embed(opt)
         h_sar = self.sar_embed(sar)

@@ -109,7 +109,7 @@ def main(args):
 
 def create_argparser():
     defaults = dict(
-        data_dir="/data/SEN12MS/SEN12MSCR",
+        data_dir="/home/work/dataset/SEN12MSCR",
         dataset="sen12mscr",
         schedule_sampler="uniform",
         frac=0.1,
