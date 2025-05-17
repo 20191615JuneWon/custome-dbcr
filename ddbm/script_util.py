@@ -15,11 +15,12 @@ def model_and_diffusion_defaults():
 
     return dict(
         sigma_data=0.5,
-        sigma_min=0.002,
-        sigma_max=80.0,
+        sigma_min=0.0001,
+        sigma_max=1.0,
         beta_d=2,
         beta_min=0.1,
-        cov_xy=0.,
+        beta_max=1.0,
+        cov_xy=0.0,
 
         image_size=256,
         in_channels=13,                   # Sentinel-2 13개 밴드
@@ -46,8 +47,8 @@ def sample_defaults():
         clip_denoised=True,
         sampler="heun",
         s_churn=0.0,
-        s_tmin=0.002,
-        s_tmax=80.0,
+        s_tmin=0.0001,
+        s_tmax=1.0,
         s_noise=1.0,
         steps=40,
         model_path="",
@@ -92,12 +93,13 @@ def create_model_and_diffusion(
     use_fp16=False,
 
     sigma_data=0.5,
-    sigma_min=0.002,
-    sigma_max=80.0,
+    sigma_min=0.0001,
+    sigma_max=1.0,
     beta_d=2,
     beta_min=0.1,
-    cov_xy=0.,
-    pred_mode="ve",
+    beta_max=1.0,
+    cov_xy=0.0,
+    pred_mode="vp",
     weight_schedule="karras",
     rho=7.0,
 ):

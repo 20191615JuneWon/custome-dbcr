@@ -32,21 +32,13 @@ def main(args):
 
     if dist.get_rank() == 0:
         name = args.exp if args.resume_checkpoint == "" else args.exp + "_resume"
-        wandb.init(project="dbcr", group=args.exp, name=name, config=vars(args), mode='online' if not args.debug else 'disabled')
+        # wandb.init(project="dbcr", group=args.exp, name=name, config=vars(args), mode='online' if not args.debug else 'disabled')
         logger.log("creating model and diffusion...")
 
     md_kwargs = args_to_dict(args, model_and_diffusion_defaults().keys())
     model, diffusion = create_model_and_diffusion(**md_kwargs)
 
     model.to(device)
-    if args.use_fp16:
-        model.half()
-
-    if hasattr(diffusion, "to"):
-        diffusion.to(device)
-
-    if dist.get_rank() == 0:
-        wandb.watch(model, log='all')
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
     if args.batch_size == -1:
@@ -111,16 +103,16 @@ def create_argparser():
     defaults = dict(
         data_dir="/home/work/dataset/SEN12MSCR",
         dataset="sen12mscr",
-        schedule_sampler="uniform",
+        schedule_sampler="real-uniform",
         frac=0.1,
         seed=42,
-        lr=1e-5,
+        lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
         total_training_steps=285125, # 10000000
         global_batch_size=1,
         batch_size=4,                 # 40 -> 4 -> 8 x -> B * 23(image) * 256 * 256 -> 128 * 128
-        microbatch=1,
+        microbatch=-1,
         ema_rate="0.9999",
         log_interval=125,
         sample_interval=11405,

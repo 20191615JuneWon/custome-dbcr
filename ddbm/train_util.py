@@ -12,28 +12,17 @@ from torch.optim import RAdam
 from torchvision.utils import save_image
 
 from . import dist_util, logger
-from .fp16_util import MixedPrecisionTrainer
 from .nn import update_ema
-from .resample import LossAwareSampler, UniformSampler
 
 from ddbm.random_util import get_generator
-from .fp16_util import (
-    get_param_groups_and_shapes,
-    make_master_params,
-    master_params_to_model_params,
-)
 import numpy as np
 from ddbm.script_util import NUM_CLASSES
 
 from ddbm.karras_diffusion import karras_sample
 
 import glob 
-# For ImageNet experiments, this was a good default value.
-# We found that the lg_loss_scale quickly climbed to
-# 20-21 within the first ~1K steps of training.
-INITIAL_LOG_LOSS_SCALE = 20.0
 
-# import wandb
+
 
 class TrainLoop:
     def __init__(
@@ -82,7 +71,7 @@ class TrainLoop:
         self.resume_checkpoint = resume_checkpoint
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
-        self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
+        self.schedule_sampler = schedule_sampler
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
         self.total_training_steps = total_training_steps
@@ -94,30 +83,27 @@ class TrainLoop:
         self.sync_cuda = th.cuda.is_available()
 
         self._load_and_sync_parameters()
-        self.mp_trainer = MixedPrecisionTrainer(
-            model=self.model,
-            use_fp16=self.use_fp16,
-            fp16_scale_growth=fp16_scale_growth,
-        )
+        # self.mp_trainer = MixedPrecisionTrainer(
+        #     model=self.model,
+        #     use_fp16=self.use_fp16,
+        #     fp16_scale_growth=fp16_scale_growth,
+        # )
+
+        self.scaler = th.amp.GradScaler('cuda', enabled=self.use_fp16)
 
         self.dtype = th.float16 if use_fp16 else th.float32
         self.device = dist_util.dev()
 
         self.opt = RAdam(
-            self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
-        )
+            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        
         if self.resume_step:
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
             # being specified at the command line.
-            self.ema_params = [
-                self._load_ema_parameters(rate) for rate in self.ema_rate
-            ]
+            self.ema_params = [self._load_ema_parameters(rate) for rate in self.ema_rate]
         else:
-            self.ema_params = [
-                copy.deepcopy(self.mp_trainer.master_params)
-                for _ in range(len(self.ema_rate))
-            ]
+            self.ema_params = [copy.deepcopy(list(self.model.parameters())) for _ in range(len(self.ema_rate))]
 
         if th.cuda.is_available():
             self.use_ddp = True
@@ -125,9 +111,7 @@ class TrainLoop:
                 self.model,
                 device_ids=[dist_util.dev()],
                 output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=True,
+                find_unused_parameters=True
             )
         else:
             if dist.get_world_size() > 1:
@@ -142,7 +126,6 @@ class TrainLoop:
 
         self.generator = get_generator(sample_kwargs['generator'], self.batch_size, sample_kwargs['seed'])
         self.sample_kwargs = sample_kwargs
-
         self.augment = augment_pipe
     
 
@@ -233,6 +216,7 @@ class TrainLoop:
                 cond = {'opt': opt, 'sar': sar}
                     
                 took_step = self.run_step(batch, cond)
+
                 if self.step % self.log_interval == 0:
                     logger.dumpkvs()     
 
@@ -263,13 +247,32 @@ class TrainLoop:
 
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
-        took_step = self.mp_trainer.optimize(self.opt)
-        if took_step:
-            self.step += 1
-            self._update_ema()
+        logger.logkv_mean("lg_loss_scale", np.log2(self.scaler.get_scale()))
+        self.scaler.unscale_(self.opt)
+
+        def _compute_norms():
+            grad_norm = 0.0
+            param_norm = 0.0
+            for p in self.model.parameters():
+                with th.no_grad():
+                    param_norm += th.norm(p, p=2, dtype=th.float32).item() ** 2
+                    if p.grad is not None:
+                        grad_norm += th.norm(p.grad, p=2, dtype=th.float32).item() ** 2
+            return np.sqrt(grad_norm), np.sqrt(param_norm)
+        
+        grad_norm, param_norm = _compute_norms()
+
+        logger.logkv_mean("grad_norm", grad_norm)
+        logger.logkv_mean("param_norm", param_norm)
+
+        self.scaler.step(self.opt)
+        self.scaler.update()
+        self.step += 1
+        self._update_ema()
+
         self._anneal_lr()
         self.log_step()
-        return took_step
+        return True
 
     def run_test_step(self, batch, cond):
         with th.no_grad():
@@ -277,55 +280,45 @@ class TrainLoop:
 
     def forward_backward(self, batch, cond, train=True):
         if train:
-            self.mp_trainer.zero_grad()
+            self.opt.zero_grad()
 
         x0    = batch.to(device=self.device, dtype=self.dtype)
         opt   = cond['opt'].to(device=self.device, dtype=self.dtype)
         sar   = cond['sar'].to(device=self.device, dtype=self.dtype)
 
-        noise = th.randn_like(opt)
-        xT    = x0 + self.diffusion.sigma_max * noise
+        sub_cond = {'opt': opt, 'sar': sar, 'x0': x0}
+        num_microbatches = batch.shape[0] // self.microbatch
+        for i in range(0, batch.shape[0], self.microbatch):
+            with th.autocast(device_type="cuda", dtype=th.float16, enabled=self.use_fp16):
+                micro = batch[i : i + self.microbatch].to(dist_util.dev())
+                micro_cond = {k: v[i : i + self.microbatch].to(dist_util.dev()) for k, v in cond.items()}
+                last_batch = (i + self.microbatch) >= batch.shape[0]
 
-        sub_cond = {'opt': opt, 'sar': sar, 'x0': x0, 'xT': xT}
+                t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+                print("train_util, t", t.min().cpu().item(), t.min().cpu().item())
+                compute_losses = functools.partial(
+                    self.diffusion.training_bridge_losses,
+                    self.ddp_model,
+                    t,
+                    model_kwargs=sub_cond,
+                )
 
-        t, weights = self.schedule_sampler.sample(opt.shape[0], device=dist_util.dev())
+                if last_batch or not self.use_ddp:
+                    losses = compute_losses()
+                else:
+                    with self.ddp_model.no_sync():
+                        losses = compute_losses()
 
-        if t.dim() == 0:
-            weights = weights.unsqueeze(0)
-            t       = t.unsqueeze(0)
-
-        t = t.to(device=self.device, dtype=self.dtype)
-        weights = weights.to(device=self.device, dtype=self.dtype)
-
-        loss_fn = functools.partial(
-            self.diffusion.training_bridge_losses,
-            self.ddp_model,
-            t,
-            model_kwargs=sub_cond,
-            noise=noise
-        )
-
-        if train and not self.use_ddp:
-            with self.ddp_model.no_sync():
-                losses = loss_fn()
-        else:
-            losses = loss_fn()
-
-        if train and isinstance(self.schedule_sampler, LossAwareSampler):
-            self.schedule_sampler.update_with_local_losses(
-                t, losses['loss'].detach()
-            )
-
-        loss = (losses['loss'] * weights).mean()
-        self._log_losses(t, losses, prefix='' if train else 'test_')
-        if train:
-            self.mp_trainer.backward(loss)
+                loss = (losses["loss"] * weights).mean() / num_microbatches
+            log_loss_dict(self.diffusion, t, {k if train else "test_" + k: v * weights for k, v in losses.items()})
+            if train:
+                self.scaler.scale(loss).backward()
 
 
 
     def _update_ema(self):
         for rate, params in zip(self.ema_rate, self.ema_params):
-            update_ema(params, self.mp_trainer.master_params, rate=rate)
+            update_ema(params, self.model.parameters(), rate=rate)
 
     def _anneal_lr(self):
         if not self.lr_anneal_steps:
@@ -334,6 +327,7 @@ class TrainLoop:
         lr = self.lr * (1 - frac_done)
         for param_group in self.opt.param_groups:
             param_group["lr"] = lr
+
 
     def _log_losses(self, t, losses, prefix=''):
         logger.logkv(f"{prefix}step", self.step)
@@ -419,7 +413,7 @@ class TrainLoop:
             model        = self.model,
             x_t          = opt_noise,
             x_0          = target.to(device, dtype),  
-            steps        = 40,
+            steps        = self.step,
             clip_denoised= True,
             progress     = False,
             model_kwargs = {'opt': opt, 'sar': sar},
