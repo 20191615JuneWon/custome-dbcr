@@ -208,7 +208,7 @@ class TrainLoop:
                         self.save()
                     return
 
-                target = target.to(device=self.device, dtype=self.dtype)
+                target = self.preprocess(target).to(device=self.device, dtype=self.dtype)
                 opt    = self.preprocess(opt).to(device=self.device, dtype=self.dtype)
                 sar    = self.preprocess(sar).to(device=self.device, dtype=self.dtype)
 
@@ -295,7 +295,6 @@ class TrainLoop:
                 last_batch = (i + self.microbatch) >= batch.shape[0]
 
                 t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
-                print("train_util, t", t.min().cpu().item(), t.min().cpu().item())
                 compute_losses = functools.partial(
                     self.diffusion.training_bridge_losses,
                     self.ddp_model,
@@ -313,7 +312,6 @@ class TrainLoop:
             log_loss_dict(self.diffusion, t, {k if train else "test_" + k: v * weights for k, v in losses.items()})
             if train:
                 self.scaler.scale(loss).backward()
-
 
 
     def _update_ema(self):
@@ -351,14 +349,17 @@ class TrainLoop:
 
     def save(self, for_preemption=False):
         def maybe_delete_earliest(filename):
-            wc = filename.split(f'{(self.step):06d}')[0]+'*'
+            wc = filename.split(f"{(self.step):06d}")[0] + "*"
             freq_states = list(glob.glob(os.path.join(get_blob_logdir(), wc)))
-            if len(freq_states) > 3:
-                earliest = min(freq_states, key=lambda x: x.split('_')[-1].split('.')[0])
+            if len(freq_states) > 3000:
+                earliest = min(freq_states, key=lambda x: x.split("_")[-1].split(".")[0])
                 os.remove(earliest)
-                    
+
         def save_checkpoint(rate, params):
-            state_dict = self.mp_trainer.master_params_to_state_dict(params)
+            state_dict = self.model.state_dict()
+            for i, (name, _) in enumerate(self.model.named_parameters()):
+                assert name in state_dict
+                state_dict[name] = params[i]
             if dist.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
@@ -368,7 +369,7 @@ class TrainLoop:
                 if for_preemption:
                     filename = f"freq_{filename}"
                     maybe_delete_earliest(filename)
-                
+
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(state_dict, f)
 
@@ -380,7 +381,7 @@ class TrainLoop:
             if for_preemption:
                 filename = f"freq_{filename}"
                 maybe_delete_earliest(filename)
-                
+
             with bf.BlobFile(
                 bf.join(get_blob_logdir(), filename),
                 "wb",
@@ -389,9 +390,9 @@ class TrainLoop:
 
         # Save model parameters last to prevent race conditions where a restart
         # loads model at step N, but opt/ema state isn't saved for step N.
-        save_checkpoint(0, self.mp_trainer.master_params)
+        save_checkpoint(0, list(self.model.parameters()))
         dist.barrier()
-    
+
 
     @th.no_grad()
     def sample_and_save(self, cond, target):
