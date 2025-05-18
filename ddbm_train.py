@@ -106,7 +106,7 @@ def create_argparser():
         schedule_sampler="real-uniform",
         frac=0.1,
         seed=42,
-        lr=1e-4,
+        lr=1e-5,
         weight_decay=0.0,
         lr_anneal_steps=0,
         total_training_steps=285125, # 10000000
