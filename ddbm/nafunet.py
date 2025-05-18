@@ -240,10 +240,6 @@ class SFBlock(nn.Module):
         return self.out_proj(out)
 
 class NAFBlock(nn.Module):
-    """
-    1. LN → MBConv → +X
-    2. LN → FFN (with SimpleGate) → +Z
-    """
     def __init__(
         self,
         channels,
@@ -251,60 +247,39 @@ class NAFBlock(nn.Module):
         dims=2,
         use_checkpoint=False,
         emb_channels=None,
-        use_scale_shift_norm=True,
+        use_scale_shift_norm=False,
     ):
         super().__init__()
         assert channels % 2 == 0, "channels must be divisible by 2 for SimpleGate"
         self.use_checkpoint = use_checkpoint
         self.use_scale_shift_norm = use_scale_shift_norm
 
-        # 1) first normalization + MBConv
         self.norm1 = normalization(channels)
         self.mbconv = MBConv(channels, channels, dims=dims, dropout=dropout)
 
-        # 2) second normalization + FFN w/ SimpleGate baked in
         self.norm2 = normalization(channels)
         hidden = channels * 2
-        # In Paper, Apply SimpleGate after ffn ... ?
         self.ffn = nn.Sequential(
-            # expand to 2×channels
             conv_nd(dims, channels, hidden, 3, padding=1),
             conv_nd(dims, hidden, hidden, 3, padding=1),
-            SimpleGate(),
         )
-
-        # optional scale‑&‑shift time embedding
-        if emb_channels is not None:
-            out_dim = 2 * channels if use_scale_shift_norm else channels
-            self.emb_layers = nn.Sequential(
-                nn.SiLU(),
-                linear(emb_channels, out_dim), # 22 -> 44, 44 -> 88, 88 -> 176
-            )
-        else:
-            self.emb_layers = None
+        self.sg = SimpleGate()
 
     def forward(self, x, emb=None):
-        # gradient checkpointing if desired
         return checkpoint(self._forward, (x, emb), self.parameters(), self.use_checkpoint)
 
-    def _forward(self, x, emb):
-
+    def _forward(self, x, emb=None):
         h = self.norm1(x).to(x.dtype)
         h = self.mbconv(h)
         x1 = x + h
 
         h2 = self.norm2(x1).to(x.dtype)
-
-        if self.emb_layers is not None and emb is not None:
-            emb_out = self.emb_layers(emb.to(x.dtype))
-            if self.use_scale_shift_norm:
-                scale, shift = emb_out.chunk(2, dim=1)
-                h2 = h2 * (1 + scale[..., None, None]) + shift[..., None, None]
-            else:
-                h2 = h2 + emb_out[..., None, None]
-
         h2 = self.ffn(h2)
-        return x1 + h2
+
+        h3 = self.sg(h2)
+
+        return h3 + x1
+
 
 
 
@@ -432,6 +407,7 @@ class NAFUNetModel(nn.Module):
         h_sar = self.sar_embed(sar)
 
         for lvl in range(self.num_levels):
+
             for blk in self.encoder_opt[lvl]:
                 h_opt = blk(h_opt, t_emb)
             for blk in self.encoder_sar[lvl]:
