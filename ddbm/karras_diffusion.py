@@ -80,7 +80,6 @@ class DDBMPreCond(PreCond):
 
     def _get_scalings_and_weightings(self, t):
         a_t, b_t, c_t = self.ns.get_abc(t)
-
         A = a_t**2 * self.sigma_data_end**2 + b_t**2 * self.sigma_data**2 + 2 * a_t * b_t * self.cov_xy + c_t**2
         c_in = 1 / (A) ** 0.5
         c_skip = (b_t * self.sigma_data**2 + a_t * self.cov_xy) / A
@@ -90,6 +89,7 @@ class DDBMPreCond(PreCond):
         c_noise = 1000 * 0.25 * th.log(t + 1e-44)
         weightings = 1 / c_out**2
         return c_skip, c_in, c_out, c_noise, weightings
+
 
 
 class KarrasDenoiser(nn.Module):
@@ -167,8 +167,6 @@ class KarrasDenoiser(nn.Module):
         terms = {}
 
         x_t = self.bridge_sample(x0, opt, sigmas, noise)
-        print("x_t:", x_t.min().cpu().item())
-
         _, denoised, weights = self.denoise(
             model,
             x_t,
@@ -176,31 +174,23 @@ class KarrasDenoiser(nn.Module):
             sar=sar,
             opt=opt
         )
-
+        
         terms["xs_mse"] = mean_flat((denoised - x0) ** 2)
         terms["mse"] = mean_flat(weights * (denoised - x0) ** 2)
 
         terms["loss"] = terms["mse"]
-
         return terms
 
 
     def denoise(self, model, x_t, sigmas, sar, **model_kwargs):
         sar = sar.to(self.dtype)
-        opt = model_kwargs['opt'].to(self.dtype)
-
-        c_skip, c_in, c_out, c_noise, weights = self.precond.get_scalings_and_weightings(sigmas, opt.ndim)
+        c_skip, c_in, c_out, c_noise, weights = self.precond.get_scalings_and_weightings(sigmas, x_t.ndim)
 
         opt_in = c_in * x_t
         model_output = model(opt_in, c_noise, opt=opt_in, sar=sar).to(self.dtype)
         denoised     = c_out * model_output + c_skip * x_t
-        print("model", model_output.min().cpu().item(), model_output.max().cpu().item())
-        print("denoi",denoised.min().cpu().item(), denoised.max().cpu().item())
-        print("c-skip",c_skip.min().cpu().item(), c_skip.max().cpu().item())
-        print("in",c_in.min().cpu().item(), c_in.max().cpu().item())
-        print("out",c_out.min().cpu().item(), c_out.max().cpu().item())
-        print("noise",c_noise.min().cpu().item(), c_noise.max().cpu().item())
-        print("weights",weights.min().cpu().item(), weights.max().cpu().item())
+
+        print('model_output', model_output.min().cpu().item())
         return model_output, denoised, weights
    
 
@@ -216,8 +206,8 @@ def karras_sample(
     callback=None,
     model_kwargs=None,
     device=None,
-    sigma_min=0.002,
-    sigma_max=80,  # higher for highres?
+    sigma_min=0.0001,
+    sigma_max=1.0,  # higher for highres?
     rho=7.0,
     sampler="heun",
     churn_step_ratio=0.,
