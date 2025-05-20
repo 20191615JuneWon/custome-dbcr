@@ -109,17 +109,17 @@ def create_argparser():
         lr=1e-5,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        total_training_steps=285125, # 10000000
+        total_training_steps=142562, # 10000000
         global_batch_size=1,
-        batch_size=4,                 # 40 -> 4 -> 8 x -> B * 23(image) * 256 * 256 -> 128 * 128
+        batch_size=16,
         microbatch=-1,
         ema_rate="0.9999",
         log_interval=125,
         sample_interval=11405,
-        save_interval=11405,
+        save_interval=11405,           #11405 -> 2500
         save_interval_for_preemption=57025,
-        resume_checkpoint="",
-        exp="",
+        resume_checkpoint="/home/work/workdir/model_114050.pt",
+        exp=".",
         use_fp16=False,
         fp16_scale_growth=1e-3,
         debug=False,
@@ -131,6 +131,8 @@ def create_argparser():
     add_dict_to_argparser(parser, defaults)
     return parser
 
+# 10807: Batch_size = 8, 285125, with se
+# 10821: Batch_size = 16, 71281
 if __name__ == "__main__":
     args = create_argparser().parse_args()
     main(args)
