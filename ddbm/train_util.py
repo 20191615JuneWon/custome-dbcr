@@ -9,8 +9,9 @@ import torch as th
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import RAdam
-from torchvision.utils import save_image
-
+from torchvision.utils import save_image, make_grid
+import torch.nn.functional as F
+import math
 from . import dist_util, logger
 from .nn import update_ema
 
@@ -83,11 +84,6 @@ class TrainLoop:
         self.sync_cuda = th.cuda.is_available()
 
         self._load_and_sync_parameters()
-        # self.mp_trainer = MixedPrecisionTrainer(
-        #     model=self.model,
-        #     use_fp16=self.use_fp16,
-        #     fp16_scale_growth=fp16_scale_growth,
-        # )
 
         self.scaler = th.amp.GradScaler('cuda', enabled=self.use_fp16)
 
@@ -97,6 +93,9 @@ class TrainLoop:
         self.opt = RAdam(
             self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         
+        
+        # th.autograd.set_detect_anomaly(True)
+
         if self.resume_step:
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
@@ -138,28 +137,24 @@ class TrainLoop:
                 logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
                 logger.log('Resume step: ', self.resume_step)
                 
-            self.model.load_state_dict(
-                # dist_util.load_state_dict(
-                #     resume_checkpoint, map_location=dist_util.dev()
-                # ),
+            self.model.load_state_dict(  
                 th.load(resume_checkpoint, map_location=dist_util.dev()),
             )
+            self.model.to(dist_util.dev())
         
             dist.barrier()
 
     def _load_ema_parameters(self, rate):
-        ema_params = copy.deepcopy(self.mp_trainer.master_params)
+        ema_params = copy.deepcopy(list(self.model.parameters()))
 
         main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
         ema_checkpoint = find_ema_checkpoint(main_checkpoint, self.resume_step, rate)
         if ema_checkpoint:
             if dist.get_rank() == 0:
                 logger.log(f"loading EMA from checkpoint: {ema_checkpoint}...")
-            # state_dict = dist_util.load_state_dict(
-            #     ema_checkpoint, map_location=dist_util.dev()
-            # )
+
             state_dict = th.load(ema_checkpoint, map_location=dist_util.dev())
-            ema_params = self.mp_trainer.state_dict_to_master_params(state_dict)
+            ema_params = [state_dict[name] for name, _ in self.model.named_parameters()]
 
             dist.barrier()
         return ema_params
@@ -167,9 +162,7 @@ class TrainLoop:
     def _load_optimizer_state(self):
         main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
         base = os.path.basename(main_checkpoint)
-        if base.startswith('latest_'):
-            prefix = "latest_"
-        elif base.startswith('freq_'):
+        if base.startswith('freq_'):
             prefix = 'freq_'
         else:
             prefix = ''
@@ -180,9 +173,6 @@ class TrainLoop:
         )
         if bf.exists(opt_checkpoint):
             logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
-            # state_dict = dist_util.load_state_dict(
-            #     opt_checkpoint, map_location=dist_util.dev()
-            # )
             state_dict = th.load(opt_checkpoint, map_location=dist_util.dev())
             self.opt.load_state_dict(state_dict)
             dist.barrier()
@@ -197,7 +187,7 @@ class TrainLoop:
                 # TODO:
                 if self.step >= self.total_training_steps:
                     (test_opt, test_sar), test_target = next(iter(self.test_data))
-                    test_target = test_target.to(device=self.device, dtype=self.dtype)
+                    test_target = self.preprocess(test_target).to(device=self.device, dtype=self.dtype)
                     test_opt    = self.preprocess(test_opt).to(device=self.device, dtype=self.dtype)
                     test_sar    = self.preprocess(test_sar).to(device=self.device, dtype=self.dtype)
                     
@@ -223,7 +213,7 @@ class TrainLoop:
                 if self.step % self.sample_interval == 0:
                     (test_opt, test_sar), test_target = next(iter(self.test_data))
 
-                    test_target = test_target.to(device=self.device, dtype=self.dtype)
+                    test_target = self.preprocess(test_target).to(device=self.device, dtype=self.dtype)
                     test_opt    = self.preprocess(test_opt).to(device=self.device, dtype=self.dtype)
                     test_sar    = self.preprocess(test_sar).to(device=self.device, dtype=self.dtype)
 
@@ -249,6 +239,15 @@ class TrainLoop:
         self.forward_backward(batch, cond)
         logger.logkv_mean("lg_loss_scale", np.log2(self.scaler.get_scale()))
         self.scaler.unscale_(self.opt)
+
+        for name, p in self.model.named_parameters():
+            if p.grad is not None:
+                p.grad.data = th.nan_to_num(
+                    p.grad.data,
+                    nan=0.0,
+                    posinf=1e3,
+                    neginf=-1e3
+                )
 
         def _compute_norms():
             grad_norm = 0.0
@@ -282,36 +281,44 @@ class TrainLoop:
         if train:
             self.opt.zero_grad()
 
-        x0    = batch.to(device=self.device, dtype=self.dtype)
+        batch = batch.to(device=self.device, dtype=self.dtype)
         opt   = cond['opt'].to(device=self.device, dtype=self.dtype)
         sar   = cond['sar'].to(device=self.device, dtype=self.dtype)
 
-        sub_cond = {'opt': opt, 'sar': sar, 'x0': x0}
+        
         num_microbatches = batch.shape[0] // self.microbatch
         for i in range(0, batch.shape[0], self.microbatch):
-            with th.autocast(device_type="cuda", dtype=th.float16, enabled=self.use_fp16):
-                micro = batch[i : i + self.microbatch].to(dist_util.dev())
-                micro_cond = {k: v[i : i + self.microbatch].to(dist_util.dev()) for k, v in cond.items()}
-                last_batch = (i + self.microbatch) >= batch.shape[0]
+            last_batch = (i + self.microbatch) >= batch.size(0)
 
-                t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+            micro_x0  = batch[i : i + self.microbatch].to(dist_util.dev())
+            micro_opt = opt[i : i + self.microbatch].to(dist_util.dev())
+            micro_sar = sar[i : i + self.microbatch].to(dist_util.dev())
+
+            with th.autocast(device_type="cuda", dtype=th.float32, enabled=self.use_fp16):
+                t, weights = self.schedule_sampler.sample(
+                    micro_x0.shape[0], dist_util.dev()
+                )
+
+                micro_cond = {'x0': micro_x0, 'opt': micro_opt, 'sar': micro_sar}
                 compute_losses = functools.partial(
                     self.diffusion.training_bridge_losses,
                     self.ddp_model,
                     t,
-                    model_kwargs=sub_cond,
+                    model_kwargs=micro_cond,
                 )
 
-                if last_batch or not self.use_ddp:
-                    losses = compute_losses()
-                else:
+                if self.use_ddp and not last_batch:
                     with self.ddp_model.no_sync():
                         losses = compute_losses()
-
+                else:
+                    losses = compute_losses()
+                
                 loss = (losses["loss"] * weights).mean() / num_microbatches
+            
             log_loss_dict(self.diffusion, t, {k if train else "test_" + k: v * weights for k, v in losses.items()})
             if train:
                 self.scaler.scale(loss).backward()
+
 
 
     def _update_ema(self):
@@ -393,7 +400,6 @@ class TrainLoop:
         save_checkpoint(0, list(self.model.parameters()))
         dist.barrier()
 
-
     @th.no_grad()
     def sample_and_save(self, cond, target):
         device = self.device
@@ -403,16 +409,16 @@ class TrainLoop:
         sar = cond['sar'].to(device=device, dtype=dtype)
 
         if target is None:
-            raise ValueError("`target` (MS ground truth) must be provided for sampling.")
+            raise ValueError("target (MS ground truth) must be provided for sampling.")
         
-        ms_shape = target.shape
-        x_t = th.randn(ms_shape, device=device, dtype=dtype) * self.diffusion.sigma_max
+        # ms_shape = target.shape
+        # x_t = th.randn(ms_shape, device=device, dtype=dtype) * self.diffusion.sigma_max
 
-        opt_noise = opt + x_t
+        # opt_noise = opt + x_t
         sample, path, nfe = karras_sample(
             diffusion    = self.diffusion,
             model        = self.model,
-            x_t          = opt_noise,
+            x_t          = opt,
             x_0          = target.to(device, dtype),  
             steps        = self.step,
             clip_denoised= True,
@@ -421,45 +427,27 @@ class TrainLoop:
             device       = device,
         )
 
-        sample = (sample + 1) * 0.5
-        sample = sample.clamp(0, 1).cpu()
-
+        B = sample.size(0)
         out_dir = os.path.join(get_blob_logdir(), "samples")
         os.makedirs(out_dir, exist_ok=True)
 
-        B, _, _, _ = sample.shape
+        def to_image(tensor):
+            img = (tensor + 1) * 0.5
+            return img.clamp(0,1).cpu()
+
+        sample_img = to_image(sample)
+        opt_img    = to_image(opt)
+        gt_img     = to_image(target)
 
         for i in range(B):
-            img_ms = sample[i]
-            rgb = img_ms[[3, 2, 1], :, :]
-            fn = os.path.join(out_dir, f"sample_ms_{i}.png")
-            save_image(rgb, fn, normalize=True)
-
-        opt_vis = (opt + 1) * 0.5
-        opt_vis = opt_vis.clamp(0, 1).cpu()
-        for i in range(B):
-            img_opt = opt_vis[i]
-            img_opt = img_opt[[3, 2, 1], :, :]
-            fn = os.path.join(out_dir, f"input_opt_{i}.png")
-            save_image(img_opt, fn, normalize=True)
-
-        # sar_vis = sar.clamp(0, 1).cpu()
-        # for i in range(sar_vis.shape[0]):
-        #     for b in range(sar_vis.shape[1]):
-        #         img_sar = sar_vis[i, b : b+1, :, :]
-        #         fn = os.path.join(out_dir, f"input_sar_{i}_band{b}.png")
-        #         save_image(img_sar, fn, normalize=True)
-
-        gt = target
-        gt = gt.clamp(0, 1).cpu()
-        for i in range(B):
-            img_gt = gt[i]
-            rgb = img_gt[[3, 2, 1], :, :]
-            fn = os.path.join(out_dir, f"gt_{i}.png")
-            save_image(rgb, fn, normalize=True)
-
+            imgs = [
+                gt_img    [i, [3,2,1], :, :],   # gt
+                opt_img   [i, [3,2,1], :, :],   # input
+                sample_img[i, [3,2,1], :, :],   # sample
+            ]
+            grid = make_grid(imgs, nrow=3, normalize=False)
+            save_image(grid, os.path.join(out_dir, f"comparison_{i}.png"))
         print(f"[inference] nfe={nfe}, saved {B} samples to {out_dir}")
-
 
 
 
