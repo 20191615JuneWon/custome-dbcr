@@ -128,6 +128,8 @@ def timestep_embedding(timesteps, dim, max_period=10000):
     :param max_period: controls the minimum frequency of the embeddings.
     :return: an [N x dim] Tensor of positional embeddings.
     """
+    if timesteps.dim() == 0:
+        timesteps = timesteps.unsqueeze(0)
     half = dim // 2
     freqs = th.exp(
         -math.log(max_period) * th.arange(start=0, end=half, dtype=th.float32) / half
@@ -213,11 +215,14 @@ class LayerNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.g = nn.Parameter(torch.ones(1, channels, 1, 1))
+        self.b = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x):
         mean = x.mean(dim=1, keepdim=True)
         var = x.var(dim=1, unbiased=False, keepdim=True)
-        return (x - mean) * (var + self.eps).rsqrt() * self.g
+        x_norm = (x - mean) * (var + self.eps).rsqrt()
+        return x_norm * self.g + self.b
+
 
 
     
