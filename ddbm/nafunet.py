@@ -393,35 +393,56 @@ class NAFUNetModel(nn.Module):
             m.float()
 
     def forward(self, x, t, opt, sar):
-        self.dtype = opt
         t   = t.to(self.dtype)
         opt = opt.to(self.dtype)
         sar = sar.to(self.dtype)
 
         t_emb = timestep_embedding(t, dim=self.emb_channels).to(self.dtype)
-        
         # TODO:
-        # opt = self.scaler(opt)
+        opt = self.scaler(opt)
 
         h_opt = self.opt_embed(opt)
+        if th.isnan(h_opt).any():
+            print("1")
         h_sar = self.sar_embed(sar)
+        if th.isnan(h_sar).any():
+                print("2")
 
         for lvl in range(self.num_levels):
 
             for blk in self.encoder_opt[lvl]:
                 h_opt = blk(h_opt, t_emb)
+                if th.isnan(h_opt).any():
+                    print("3")
             for blk in self.encoder_sar[lvl]:
                 h_sar = blk(h_sar, t_emb)
+                if th.isnan(h_sar).any():
+                    print("4")
 
             h_opt = self.fusion_blocks[lvl](h_opt, h_sar)
+            if th.isnan(h_opt).any():
+                print("5")
+
             if lvl < self.num_levels-1:
                 h_opt = self.downsamples_opt[lvl](h_opt)
+                if th.isnan(h_opt).any():
+                    print("6")
                 h_sar = self.downsamples_sar[lvl](h_sar)
+                if th.isnan(h_sar).any():
+                    print("7")
 
         h = self.middle_block(h_opt, t_emb)
+        if th.isnan(h).any():
+            print("8")
         for i, dec in enumerate(self.decoder):
             h = dec(h, t_emb)
+            if th.isnan(h).any():
+                print("9")
             if i < len(self.upsamples):
                 h = self.upsamples[i](h)
-
-        return self.out(h)
+                if th.isnan(h).any():
+                    print("10")
+        h = self.out(h)
+        if th.isnan(h).any():
+            print("11")
+        return h
