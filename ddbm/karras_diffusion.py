@@ -174,10 +174,9 @@ class KarrasDenoiser(nn.Module):
             sar=sar,
             opt=opt
         )
-        
+
         terms["xs_mse"] = mean_flat((denoised - x0) ** 2)
         terms["mse"] = mean_flat(weights * (denoised - x0) ** 2)
-
         terms["loss"] = terms["mse"]
         return terms
 
@@ -190,11 +189,9 @@ class KarrasDenoiser(nn.Module):
         model_output = model(opt_in, c_noise, opt=opt_in, sar=sar).to(self.dtype)
         denoised     = c_out * model_output + c_skip * x_t
 
-        print('model_output', model_output.min().cpu().item())
         return model_output, denoised, weights
    
 
-# diffusion, model, x_t, x_0
 def karras_sample(
     diffusion,
     model,
@@ -207,19 +204,18 @@ def karras_sample(
     model_kwargs=None,
     device=None,
     sigma_min=0.0001,
-    sigma_max=1.0,  # higher for highres?
+    sigma_max=1.0,
     rho=7.0,
     sampler="heun",
     churn_step_ratio=0.,
-    guidance=1,
+    guidance=1.5,
 ):
     assert sampler in ["heun", ], 'only heun sampler is supported currently'
     
     opt = model_kwargs['opt']
     sar = model_kwargs['sar']
 
-    sigmas = get_sigmas_karras(steps, sigma_min, sigma_max-1e-4, rho, device=device)
-  
+    sigmas = get_sigmas_karras(40, sigma_min, sigma_max-1e-4, rho, device=device)
     def denoiser(x, sigma):
         _, denoised, _ = diffusion.denoise(model, x, sigma, opt=opt, sar=sar, x0=x_0)
         
@@ -306,10 +302,10 @@ def sample_heun(
     x,
     sigmas,
     churn_step_ratio=0.,
-    guidance=1,
+    guidance=1.5,
     progress=False,
     callback=None,
-    sigma_max=80.0,
+    sigma_max=1.0,
 ):
     
     indices = range(len(sigmas)-1)
